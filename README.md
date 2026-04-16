@@ -2,7 +2,8 @@
 
 **Hyper-Hierarchical Spawn-Driven Decision** / 超分层派生驱动决策系统
 
-自主 AI Agent，单文件实现。基于 Anthropic tool_use 协议，支持递归子 Agent、能量预算管理、经验留存和自动压缩。
+自主 AI Agent，单文件实现。基于 Anthropic tool_use 协议，支持递归子 Agent、能量预算管理、经验留存和自动压缩。/n
+本项目完全基于minimax token plan制作，其他请自行适配
 
 ## 快速开始
 
