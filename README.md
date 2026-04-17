@@ -156,4 +156,4 @@ python agent.py --resume
 
 ## 架构详情
 
-详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+详见 [[ARCHITECTURE.md](ARCHITECTURE.md)](https://github.com/wefio/Hyper-Hierarchical-Spawn-Driven-Decision/blob/2403b42a8506b91c9bff40df3fe319ec3a9c105c/ARCHITECTURE.md)。
