@@ -152,8 +152,6 @@ python agent.py --resume
 4. **经验统计有效性**：贝叶斯先验在任务样本极少时（<5 次）主要起平滑作用，不具备统计显著性
 5. **无并行 Spawn**：当前 spawn_agent 为同步阻塞调用，子 Agent 完成后父级才继续
 
-```
-
 ## 架构详情
 
-详见 [[ARCHITECTURE.md](ARCHITECTURE.md)](https://github.com/wefio/Hyper-Hierarchical-Spawn-Driven-Decision/blob/2403b42a8506b91c9bff40df3fe319ec3a9c105c/ARCHITECTURE.md)。
+详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
