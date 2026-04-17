@@ -1,4 +1,4 @@
-"""经验留存库 — SQLite + FTS5 + 蚁群信息素 + memory.md 目录"""
+"""经验留存库 — SQLite + FTS5 + 经验权重 + memory.md 目录"""
 import sqlite3
 import json
 from pathlib import Path
@@ -25,12 +25,16 @@ class ExperienceStore:
                 tools_used TEXT,
                 step_count INTEGER,
                 success INTEGER DEFAULT 1,
-                pheromone REAL DEFAULT 1.0,
+                weight REAL DEFAULT 1.0,
                 created_at TEXT DEFAULT (datetime('now'))
             )""")
-            # 迁移：为已有数据库添加 pheromone 列
+            # 迁移：旧列名 pheromone → weight
             try:
-                conn.execute("ALTER TABLE experiences ADD COLUMN pheromone REAL DEFAULT 1.0")
+                conn.execute("ALTER TABLE experiences RENAME COLUMN pheromone TO weight")
+            except sqlite3.OperationalError:
+                pass  # 列已是 weight 或不存在
+            try:
+                conn.execute("ALTER TABLE experiences ADD COLUMN weight REAL DEFAULT 1.0")
             except sqlite3.OperationalError:
                 pass  # 列已存在
             try:
@@ -65,7 +69,7 @@ class ExperienceStore:
         """更新 memory.md 目录文件"""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id, task, summary, step_count, success, pheromone, created_at "
+                "SELECT id, task, summary, step_count, success, weight, created_at "
                 "FROM experiences ORDER BY id DESC LIMIT 20"
             ).fetchall()
             total = conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0]
@@ -74,7 +78,7 @@ class ExperienceStore:
         lines.append(f"Total records: {total} (showing latest 20)\n")
         for r in rows:
             status = "OK" if r[4] else "FAIL"
-            ph_str = f" φ={r[5]:.2f}" if r[5] != 1.0 else ""
+            ph_str = f" w={r[5]:.2f}" if r[5] != 1.0 else ""
             lines.append(f"- [#{r[0]}] [{status}] {r[6]} | {r[1][:60]}{ph_str}")
             if r[2]:
                 lines.append(f"  > {r[2][:80]}")
@@ -83,7 +87,7 @@ class ExperienceStore:
 
         self.memory_path.write_text("\n".join(lines), encoding='utf-8')
 
-    # ── 蚁群信息素 ──
+    # ── 经验权重 ──
 
     def _fts_query(self, q: str) -> str:
         """中文拆字 + 英文 token 化，供 FTS5 使用"""
@@ -95,18 +99,18 @@ class ExperienceStore:
             return ' OR '.join(tokens)
         return q
 
-    def update_pheromone(self, task: str, plan: str, success: bool):
-        """成功/失败后更新相关记录的信息素（targeted boost + 全局蒸发，一次连接）"""
+    def update_weights(self, task: str, plan: str, success: bool):
+        """成功/失败后更新相关记录的权重（targeted boost + 全局衰减）"""
         boost = 1.2 if success else 0.8
         fts_q = self._fts_query(task)
         try:
             with self._conn() as conn:
                 conn.execute(
-                    "UPDATE experiences SET pheromone = pheromone * ? "
+                    "UPDATE experiences SET weight = weight * ? "
                     "WHERE id IN (SELECT rowid FROM experiences_fts WHERE experiences_fts MATCH ? LIMIT 5)",
                     (boost, fts_q)
                 )
-                conn.execute("UPDATE experiences SET pheromone = pheromone * 0.99")
+                conn.execute("UPDATE experiences SET weight = weight * 0.99")
         except sqlite3.OperationalError:
             pass
 
@@ -115,18 +119,18 @@ class ExperienceStore:
         try:
             with self._conn() as conn:
                 rows = conn.execute("""
-                    SELECT e.task, e.summary, e.lessons, e.tools_used, e.step_count, e.success, e.pheromone
+                    SELECT e.task, e.summary, e.lessons, e.tools_used, e.step_count, e.success, e.weight
                     FROM experiences_fts f
                     JOIN experiences e ON e.id = f.rowid
                     WHERE experiences_fts MATCH ?
-                    ORDER BY (e.pheromone * -rank) DESC
+                    ORDER BY (e.weight * -rank) DESC
                     LIMIT ?
                 """, (fts_q, limit)).fetchall()
                 if rows:
                     return [
                         {"task": r[0], "summary": r[1], "lessons": r[2],
                          "tools_used": r[3], "steps": r[4], "success": bool(r[5]),
-                         "pheromone": r[6]}
+                         "weight": r[6]}
                         for r in rows
                     ]
         except sqlite3.OperationalError:
@@ -136,15 +140,15 @@ class ExperienceStore:
         with self._conn() as conn:
             pattern = f"%{query}%"
             rows = conn.execute(
-                "SELECT task, summary, lessons, tools_used, step_count, success, pheromone "
+                "SELECT task, summary, lessons, tools_used, step_count, success, weight "
                 "FROM experiences WHERE task LIKE ? OR summary LIKE ? OR lessons LIKE ? "
-                "ORDER BY pheromone DESC LIMIT ?",
+                "ORDER BY weight DESC LIMIT ?",
                 (pattern, pattern, pattern, limit)
             ).fetchall()
             return [
                 {"task": r[0], "summary": r[1], "lessons": r[2],
                  "tools_used": r[3], "steps": r[4], "success": bool(r[5]),
-                 "pheromone": r[6]}
+                 "weight": r[6]}
                 for r in rows
             ]
 

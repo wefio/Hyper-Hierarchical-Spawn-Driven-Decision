@@ -62,8 +62,8 @@ class Config:
     DEBUG_DIR = os.getenv("AGENT_DEBUG_DIR", "./debug_messages")
 
     # ---- 策略 ----
-    ENABLE_FIREFLY_MERGE = os.getenv("ENABLE_FIREFLY_MERGE", "true").lower() == "true"
-    FIREFLY_MERGE_THRESHOLD = float(os.getenv("FIREFLY_MERGE_THRESHOLD", "0.6"))
+    ENABLE_SUBTASK_DEDUP = os.getenv("ENABLE_SUBTASK_DEDUP", "true").lower() == "true"
+    SUBTASK_DEDUP_THRESHOLD = float(os.getenv("SUBTASK_DEDUP_THRESHOLD", "0.6"))
 
     @classmethod
     def load_env(cls, env_file: str = ".env"):
@@ -789,7 +789,7 @@ class ToolExecutor:
         parent_agent = agent_context.get("parent_agent")
         energy_mgr = parent_agent.energy_manager if parent_agent else None
 
-        # 狼群：决定 explore/exploit 模式
+        # 能量感知：决定 explore/exploit 模式
         llm_specified_mode = "mode" in args
         base_mode = args.get("mode", "exploit")
         if energy_mgr and not llm_specified_mode:
@@ -799,7 +799,7 @@ class ToolExecutor:
             explore_prob = energy_mgr.get_role_probability()
             suggested = "explore" if random.random() < explore_prob else "exploit"
             if suggested != base_mode:
-                print(f"  [Wolf] LLM={base_mode}, pack suggests {suggested} (p_explore={explore_prob:.2f})")
+                print(f"  [EnergyAware] LLM={base_mode}, energy suggests {suggested} (p_explore={explore_prob:.2f})")
             mode = base_mode
         else:
             mode = base_mode
@@ -1160,10 +1160,10 @@ class BayesianEnergyManager:
                 and self.energy > self.total_energy * energy_ratio
                 and self.total_spent < self.total_energy * 0.8)
 
-    # ── 狼群：动态角色分配 ──
+    # ── 能量感知调度 ──
 
     def get_role_probability(self) -> float:
-        """返回 explore 概率（狼群分工：高能量+低进展→多探索，反之→多利用）"""
+        """返回 explore 概率（高能量+低进展→多探索，反之→多利用）"""
         energy_ratio = self.energy / self.total_energy if self.total_energy > 0 else 0.0
         p_done = self.p_done()
         fail_penalty = min(self._no_progress_count, 5) * 0.05
@@ -1594,8 +1594,8 @@ class Agent:
                     task=exp["task"], plan=exp["plan"], summary=summary,
                     lessons=lesson, step_count=exp["step_count"], success=exp["success"]
                 )
-                # 蚁群信息素更新
-                store.update_pheromone(exp["task"], exp["plan"], exp["success"])
+                # 经验权重更新
+                store.update_weights(exp["task"], exp["plan"], exp["success"])
                 count += 1
             self._pending_experiences = []
             self._save_pending_experiences()
@@ -2327,12 +2327,12 @@ class Agent:
         self.stack.append(StackFrame("plan", "Pending plan...", level=1))
         self.step_counter = 0
 
-    # ---- 萤火虫子任务合并 ----
+    # ---- 子任务去重 ----
     def _merge_subtasks(self, subtasks: list[dict], threshold: float = None) -> list[dict]:
-        """萤火虫合并：相似子任务中，高亮度吸引低亮度，减少冗余"""
+        """子任务去重：相似子任务合并，保留更详细的描述"""
         if len(subtasks) <= 1:
             return subtasks
-        threshold = threshold or Config.FIREFLY_MERGE_THRESHOLD
+        threshold = threshold or Config.SUBTASK_DEDUP_THRESHOLD
 
         def _word_set(text: str) -> set:
             """提取中文单字 + 英文单词集合"""
@@ -2346,7 +2346,7 @@ class Agent:
         word_sets = [_word_set(s['desc']) for s in subtasks]
         avg_len = sum(len(s['desc']) for s in subtasks) / len(subtasks)
 
-        def _brightness(idx: int) -> float:
+        def _quality_score(idx: int) -> float:
             specificity = len(subtasks[idx]['desc']) / max(avg_len, 1)
             if self.energy_manager:
                 success_rate = self.energy_manager.p_subtask_success(f"sub_{idx}")
@@ -2354,14 +2354,14 @@ class Agent:
                 success_rate = 0.5
             return specificity * success_rate
 
-        # 构建合并映射：低亮度 -> 高亮度
+        # 构建合并映射：低质量 -> 高质量
         n = len(subtasks)
         merge_map = {}
         for i in range(n):
             for j in range(i + 1, n):
                 sim = _jaccard(word_sets[i], word_sets[j])
                 if sim > threshold:
-                    bi, bj = _brightness(i), _brightness(j)
+                    bi, bj = _quality_score(i), _quality_score(j)
                     if bi >= bj:
                         merge_map[j] = i
                     else:
@@ -2398,7 +2398,7 @@ class Agent:
                     merged.append({"desc": new_desc, "done": False})
                     consumed.add(i)
                     consumed.add(target)
-                    print(f"  [Firefly] Merged subtask {i+1} -> {target+1} (sim>{threshold:.1f})")
+                    print(f"  [Dedup] Merged subtask {i+1} -> {target+1} (sim>{threshold:.1f})")
                 else:
                     merged.append(subtasks[i])
             else:
@@ -2463,21 +2463,10 @@ If the task is simple, output just one STEP line."""
 
         # 初始化能量管理器（顶层 Agent）
         if not self.parent:
-            # 加载 PSO 最优参数（单实例复用）
-            self._pso_tuner = None
-            pso_params = {}
-            try:
-                from pso_tuner import PSOTuner
-                self._pso_tuner = PSOTuner()
-                pso_params = self._pso_tuner.get_best_params()
-            except Exception:
-                pass
             self.energy_manager = BayesianEnergyManager(
-                total_energy=Config.CONTEXT_BUDGET - Config.CONTEXT_RESERVE,  # 154800 token
+                total_energy=Config.CONTEXT_BUDGET - Config.CONTEXT_RESERVE,  # 154800E
                 step_overhead=Config.STEP_OVERHEAD,
-                cost_step=pso_params.get("cost_step", 2.0),
-                cost_tool=pso_params.get("cost_tool", Config.TOOL_ENERGY_COST),
-                explore_roi=pso_params.get("explore_roi", 0.5)
+                cost_tool=Config.TOOL_ENERGY_COST,
             )
             # 注入相关历史经验
             self._inject_experience(task)
@@ -2495,8 +2484,8 @@ If the task is simple, output just one STEP line."""
         # 生成计划
         print(f"\n[Plan] Analyzing task: {task}")
         self.subtask_queue = self._generate_plan(task)
-        # 萤火虫合并
-        if Config.ENABLE_FIREFLY_MERGE:
+        # 子任务去重
+        if Config.ENABLE_SUBTASK_DEDUP:
             self.subtask_queue = self._merge_subtasks(self.subtask_queue)
         plan_text = "\n".join(f"  {i+1}. {s['desc']}" for i, s in enumerate(self.subtask_queue))
         # 记录计划节点到流程图
@@ -2737,13 +2726,6 @@ If the task is simple, output just one STEP line."""
                         self.flowchart.add_edge(anchor, rw_id, label="完成")
                 except Exception:
                     pass
-            # PSO 反馈（复用 run 开头创建的实例）
-            if self._pso_tuner:
-                try:
-                    spent_ratio = em.total_spent / em.total_energy if em.total_energy > 0 else 1.0
-                    self._pso_tuner.record_task_result(success=task_success, efficiency=spent_ratio)
-                except Exception:
-                    pass
             # 最终状态
             print(f"  [Final] Energy: {em.energy:.0f} | Spent: {em.total_spent:.0f}/{em.total_energy:.0f}")
 
@@ -2850,4 +2832,4 @@ def main(t):
         agent.run(task, args.steps)
 
 if __name__ == "__main__":
-    main("hi")
+    main("34254e576a0356ee46877635dc03bd4fb414378e.jpg这是什么")
