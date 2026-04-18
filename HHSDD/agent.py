@@ -2832,4 +2832,4 @@ def main(t):
         agent.run(task, args.steps)
 
 if __name__ == "__main__":
-    main("34254e576a0356ee46877635dc03bd4fb414378e.jpg这是什么")
+    main("hi")
