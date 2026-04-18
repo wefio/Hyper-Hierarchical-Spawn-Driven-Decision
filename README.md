@@ -155,3 +155,12 @@ python agent.py --resume
 ## 架构详情
 
 详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+## 参考文档
+[上下文硬盘缓存](https://api-docs.deepseek.com/zh-cn/guides/kv_cache)<br>
+[上下文硬盘缓存技术](https://api-docs.deepseek.com/zh-cn/news/news0802)<br>
+[MiniMax接口概览](https://platform.minimaxi.com/docs/api-reference/api-overview#支持模型)<br>
+[Anthropic API 兼容](https://platform.minimaxi.com/docs/api-reference/text-anthropic-api)<br>
+[图片理解 & 网络搜索 MCP](https://platform.minimaxi.com/docs/token-plan/mcp-guide)<br>
+[Prompt 缓存](https://platform.minimaxi.com/docs/api-reference/text-prompt-caching)<br>
+[Anthropic 主动缓存](https://platform.minimaxi.com/docs/api-reference/anthropic-api-compatible-cache)<br>
