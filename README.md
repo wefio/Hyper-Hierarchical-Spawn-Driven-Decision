@@ -2,14 +2,12 @@
 
 **Hyper-Hierarchical Spawn-Driven Decision** / 超分层派生驱动决策系统
 
-自主 AI Agent，单文件实现。核心设计目标：在固定的 204K 上下文窗口内，通过 token 预算硬约束管理递归深度，并基于贝叶斯后验优化执行决策。基于 Anthropic tool_use 协议，支持递归子 Agent、能量预算管理、经验留存和自动压缩。<br>
-本项目完全基于minimax token plan制作，其他请自行适配
+自主 AI Agent，核心设计目标：在固定的上下文窗口内，通过 token 预算硬约束管理递归深度，并基于贝叶斯后验优化执行决策。基于 Anthropic tool_use 协议，支持递归子 Agent、能量预算管理、经验留存和自动压缩。通过插件系统扩展领域工具。
 
 ## 设计约束与假设
 
-- **目标模型**：MiniMax-M2.7（204800 token 上下文）
 - **API 协议**：Anthropic Messages API（支持 `tool_use` / `tool_result`）
-- **运行环境**：单文件 Python，依赖仅 `anthropic` SDK
+- **运行环境**：Python 3.10+，核心依赖仅 `anthropic` SDK
 - **核心假设**：Skill 文件在启动时一次性加载，运行期间不再变更；子 Agent 通过消息前缀继承父级上下文
 
 ## 快速开始
@@ -28,11 +26,11 @@ python agent.py --task "你的任务描述"
 # 交互模式
 python agent.py -i --task "你的任务描述"
 
+# 加载插件
+PLUGINS=example_plugin python agent.py --task "你好"
+
 # 指定 Skill
 python agent.py --skill investigation-first --task "调研 Gazebo 仿真框架"
-
-# 自动匹配 Skill
-python agent.py --auto-skill --task "分析这张图片"
 
 # 恢复上次状态
 python agent.py --resume
@@ -113,54 +111,93 @@ python agent.py --resume
 - **检索排序**：`weight × -rank`，成功路径优先
 - **写入策略**：轻量元数据即时写入；仅失败或步数≥3 的任务才调用 LLM 提取结构化教训
 
-### 流程图追踪
+### Pointer 磁盘缓存
 
-运行时生成 Mermaid 流程图，记录：
-- 任务分解与子任务节点
-- 工具调用（同 step 内同名工具合并计数）
-- Spawn 生命周期（按深度汇总：次数、探索/利用模式、完整/摘要吸收、能量释放、经验上提）
-- 能量事件（回收、压缩、截断、紧急交付、Skill 结算、终端奖励）
+将即将被淘汰的上下文持久化到本地文件，原地替换为摘要指针。支持多级 pointer、作用域隔离、LRU-K 追踪、能量联动。
+
+### 任务验证框架
+
+基于工具调用链的动态验证分派：
+- 文件操作 → 文件存在 + 非空检查
+- 命令执行 → 退出码检查
+- 领域插件 → 通过 `register_verifier()` 注册
+- 默认 → 关键词信号检测（success/failure）
+
+### Dual-Auth 双通道验证
+
+每个子任务同时由 LLM 自评和系统验证：
+- Agent 自评：LLM 判断子任务是否完成
+- 系统验证：基于工具调用链的自动化验证
+- 对话类任务（无工具调用）自动标记为完成
+
+## 插件系统
+
+HHSDD 通过插件系统扩展领域工具。插件是普通 Python 模块，实现特定接口函数即可被 Agent 加载。
+
+```bash
+PLUGINS=example_plugin    # 加载示例插件
+PLUGINS=so100_plugin      # 加载 SO100 机械臂插件
+PLUGINS=                  # 禁用所有插件
+```
+
+插件 API：
+
+| 函数 | 阶段 | 用途 |
+|------|------|------|
+| `get_tool_definitions()` | 启动 | 工具 schema（Anthropic tool_use 格式） |
+| `get_tool_handlers()` | 启动 | `{tool_name: (agent, params) -> str}` |
+| `get_cache_rules()` | 启动 | 需要缓存标记的工具名前缀 |
+| `get_platform_prompt_fragments()` | 启动 | 追加到系统提示的文本 |
+| `on_agent_init(agent, bus)` | Agent 初始化 | 事件订阅、验证器注册 |
+| `on_run_start(agent, task)` | 任务开始 | 初始化（如 trace span） |
+| `on_tool_executed(agent, tool_name, result)` | 工具执行后 | 后处理、能量结算 |
+| `on_subtask_loop(agent, sub_idx)` | 子任务循环 | 反馈注入、状态检查 |
+
+详见 [plugins/example/README.md](plugins/example/README.md)。
 
 ## 配置
 
-所有参数通过 `.env` 文件配置。详见 `.env.example`。
+所有参数通过 `.env` 文件或环境变量配置。详见 `.env.example`。
+
+关键参数：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `PLUGINS` | (空) | 逗号分隔的插件模块名 |
+| `MAX_STEPS` | 100 | 最大步骤数 |
+| `CONTEXT_BUDGET` | 204800 | 上下文窗口 |
+| `TOOL_ENERGY_COST` | 200 | 单次工具调用预扣能量 |
+| `AUTO_PLAN` | smart | 计划模式：always/smart/never |
 
 ## 项目结构
 
 ```
 ├── agent.py              # 核心：Agent / 能量 / 工具 / 栈帧 / 流程图 / 贝叶斯预估
+├── config.py             # 配置（单例，解决循环导入）
 ├── experience_store.py   # 经验库：SQLite + FTS5 + 权重更新
-├── .env                  # 运行配置
-├── ARCHITECTURE.md       # 架构设计文档
+├── pointer_store.py      # Pointer 磁盘缓存：多级归档 + 作用域隔离
+├── task_verifier.py      # 任务验证框架：工具链分派 + 动态注册
+├── plugins/              # 插件目录
+│   └── example/          # 示例插件
 ├── skills/               # Skill 定义（Markdown + YAML frontmatter）
+├── scripts/              # 脚本文件自动路由目录
 ├── agent_state/          # 运行时状态持久化
-│   ├── state.json        # 栈帧、步骤计数器、子任务队列
-│   ├── flowchart.md      # Mermaid 流程图
-│   └── pending_exp.json  # 待处理经验元数据
 ├── experience_store/     # 经验数据库
-│   ├── experience.db     # SQLite
-│   └── memory.md         # 最近 20 条记录索引
-├── history/              # 运行历史（Markdown 格式）
-└── scripts/              # 脚本文件自动路由目录
+├── history/              # 运行历史
+└── .env                  # 运行配置
 ```
 
 ## 限制
 
-1. **模型绑定**：默认面向 minimax 204K 上下文优化，其他模型需调整 `CONTEXT_BUDGET` 和 `CONTEXT_RESERVE`
-2. **API 协议**：依赖 Anthropic Messages API 的 `tool_use` 格式及 `cache_control` 扩展
-3. **Spawn 信息损耗**：深层递归下子 Agent 返回的摘要对父级而言是有损压缩，复杂依赖链可能出现语义漂移
-4. **经验统计有效性**：贝叶斯先验在任务样本极少时（<5 次）主要起平滑作用，不具备统计显著性
-5. **无并行 Spawn**：当前 spawn_agent 为同步阻塞调用，子 Agent 完成后父级才继续
+1. **API 协议**：依赖 Anthropic Messages API 的 `tool_use` 格式及 `cache_control` 扩展
+2. **Spawn 信息损耗**：深层递归下子 Agent 返回的摘要对父级而言是有损压缩，复杂依赖链可能出现语义漂移
+3. **经验统计有效性**：贝叶斯先验在任务样本极少时（<5 次）主要起平滑作用，不具备统计显著性
+4. **无并行 Spawn**：当前 spawn_agent 为同步阻塞调用，子 Agent 完成后父级才继续
 
 ## 架构详情
 
 详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-## 参考文档
-[上下文硬盘缓存](https://api-docs.deepseek.com/zh-cn/guides/kv_cache)<br>
-[上下文硬盘缓存技术](https://api-docs.deepseek.com/zh-cn/news/news0802)<br>
-[MiniMax接口概览](https://platform.minimaxi.com/docs/api-reference/api-overview#支持模型)<br>
-[Anthropic API 兼容](https://platform.minimaxi.com/docs/api-reference/text-anthropic-api)<br>
-[图片理解 & 网络搜索 MCP](https://platform.minimaxi.com/docs/token-plan/mcp-guide)<br>
-[Prompt 缓存](https://platform.minimaxi.com/docs/api-reference/text-prompt-caching)<br>
-[Anthropic 主动缓存](https://platform.minimaxi.com/docs/api-reference/anthropic-api-compatible-cache)<br>
+## 相关项目
+
+- [so100-skill](https://github.com/wefio/so100-skill) — SO100 机械臂自主抓取技能，基于 HHSDD 插件系统

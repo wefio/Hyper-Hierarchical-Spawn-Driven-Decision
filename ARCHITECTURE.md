@@ -124,14 +124,42 @@
 
 ---
 
-## 六、数据流与状态持久化
+## 六、插件系统
+
+Agent 通过 `_PLUGINS` 列表动态加载外部模块，将领域特定逻辑（工具、验证、流程兜底）从通用框架中解耦。
+
+```
+agent.py
+  ├── _load_plugins()          # importlib 动态加载
+  ├── _PLUGINS: list[module]   # 已加载的插件列表
+  │
+  ├── Agent.__init__
+  │     └── plugin.on_agent_init(self, bus)
+  ├── Agent.run()
+  │     └── plugin.on_run_start(self, task)
+  ├── ToolExecutor.execute()
+  │     ├── plugin.get_tool_definitions()   → 合并工具
+  │     ├── plugin.get_tool_handlers()      → 合并 handler
+  │     └── plugin.on_tool_executed(...)    → 后处理
+  └── 子任务循环
+        └── plugin.on_subtask_loop(...)     → 反馈注入
+```
+
+**加载流程**：`Config.PLUGINS`（逗号分隔）→ `importlib.import_module()` → 检查接口函数 → 注册到对应位置。
+
+**任务验证扩展**：插件通过 `task_verifier.register_category()` 和 `task_verifier.register_verifier()` 注册领域验证器，验证框架通过 `__getattr__` 动态分派到注册的函数。
+
+---
+
+## 七、数据流与状态持久化
 
 - **`state.json`**：保存栈帧、步骤计数器、子任务队列，支持中断恢复。
 - **`pending_exp.json`**：待处理经验元数据，累积到阈值后批量调用 LLM 提取教训并入库。
 - **`experience.db`**（SQLite + FTS5）：存储历史任务摘要、教训、权重，支持全文检索。
 - **`flowchart.md`**：Mermaid 流程图，实时记录任务执行拓扑，便于调试和可视化。
+- **`archive/`**（Pointer 磁盘缓存）：将即将被淘汰的上下文持久化到 `.md` 文件，维护 `index.json` 索引，支持按 ID/关键词/作用域召回。
 
 ---
 
-## 七、为什么用MiniMax
+## 八、为什么用MiniMax
 便宜。开发的时候只买了这个。
