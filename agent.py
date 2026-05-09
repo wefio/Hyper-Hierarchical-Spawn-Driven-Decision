@@ -2,1716 +2,40 @@ from __future__ import annotations
 import sys
 import io
 import os
-sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
-sys.stderr.reconfigure(encoding='utf-8', line_buffering=True)
-import subprocess
 import json
 import time
 import random
 import math
-import argparse
 import re
+import threading
 from collections import deque
-from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from typing import Optional, Dict, Any, List
 from pathlib import Path
-from enum import Enum, auto
 
 import anthropic
 import httpx
 
-# Config extracted to separate module to break circular import with experience_store.py
-from config import Config, smart_truncate
+from config import Config, smart_truncate, _PLUGINS
+from agent_memory_frame import StackFrame, SavepointMeta
+from skill import Skill, SkillManager
 
-# Plugin system — load domain plugins (SO100, etc.)
-import importlib
-_PLUGINS = []
-def _load_plugins():
-    for name in Config.PLUGINS:
-        name = name.strip()
-        if not name:
-            continue
-        try:
-            mod = importlib.import_module(name)
-            _PLUGINS.append(mod)
-            print(f"  [Plugin] loaded: {name}")
-        except ImportError as e:
-            print(f"  [Plugin] skipped: {name} ({e})")
-_load_plugins()
+from agent_kernel_glue import (APIClient, AnthropicCacheProvider, CacheProvider,
+    FlowchartRecorder, AgentEventBus, _get_event_bus, SavepointManager,
+    PlanState, PlanContext, SubAgentEventType, SubAgentEvent)
+from agent_process_executor import (ToolExecutor, TOOL_DEFINITIONS,
+    _build_cached_tools, energy_hooks, _spawn_deduct, _spawn_settle,
+    _cmd_deduct, _cmd_refund, _skill_deduct)
+from agent_scheduler_energy import BayesianEnergyManager, StepEstimator, ContextTooLongError
+from agent_memory_l2 import L2Cache
+from agent_memory_report import NodeReport
+from agent_kernel_router import get_router
 
-# httpx client with system proxy disabled
 _http_client = httpx.Client(proxy=None, timeout=60.0, follow_redirects=True, trust_env=False)
 
 def measure_stack(stack) -> int:
     return sum(len(f.content) for f in stack)
-
-# ============ 栈帧 ============
-@dataclass
-class StackFrame:
-    type: str      # "constraint", "plan", "step_detail", "summary", "merge", "history", "pointer"
-    content: str
-    step_id: int = 0
-    level: int = 0
-    agent_id: str = ""
-    pointer_id: str = ""       # 关联 archive pointer id
-    reclaimable: bool = False  # recall 注入的内容，优先回收
-    use_count: int = 0         # 被引用次数（LRU-K）
-    last_used_step: int = 0    # 最后使用 step
-
-
-@dataclass
-class SavepointMeta:
-    """存档点元数据 — 活跃存档点 + 历史记录共用"""
-    name: str
-    path: str                    # 全量快照磁盘路径
-    agent_id: str = ""
-    status: str = "active"       # "active", "committed", "popped"
-    energy_at_save: float = 0.0  # create 时刻的流动资金
-    total_spent_at_save: float = 0.0
-    step_counter_at_save: int = 0
-    context_chars_at_save: int = 0
-    summary: str = ""            # commit → 结论摘要, pop → 失败原因
-    created_at: float = 0.0
-    context_size: int = 0        # context_chars_at_save 的摘要（用于排序驱逐）
-
-
-# ============ 缓存抽象 ============
-class APIClient:
-    """Anthropic API 封装：限流、重试、计能、调试转储"""
-
-    def __init__(self, client: anthropic.Anthropic, config: type,
-                 cache_provider: CacheProvider, energy_mgr):
-        self.client = client
-        self.cfg = config
-        self.cache = cache_provider
-        self.em = energy_mgr
-        self._last_call_time = 0.0
-        self._debug_dir = Path(config.DEBUG_DIR)
-
-    def call(self, messages: list, system=None, tools=None,
-             max_tokens: int = 4096, bypass_energy: bool = False):
-        """调用 API，返回 Message 对象"""
-        kwargs = {"model": self.cfg.MODEL, "max_tokens": max_tokens, "messages": messages}
-        if system:
-            kwargs["system"] = system
-        if tools:
-            kwargs["tools"] = tools
-
-        self._dump("req", kwargs)
-
-        elapsed = time.time() - self._last_call_time
-        if elapsed < self.cfg.RATE_LIMIT:
-            time.sleep(self.cfg.RATE_LIMIT - elapsed)
-
-        max_retries = self.cfg.MAX_RETRIES
-        overload_retries = 0
-        max_overload = max_retries * 3
-
-        for attempt in range(max_retries + max_overload):
-            try:
-                result = self.client.messages.create(timeout=120.0, **kwargs)
-                self._last_call_time = time.time()
-                self._dump("res", result)
-
-                if not bypass_energy and hasattr(result, 'usage') and self.em:
-                    inp = getattr(result.usage, 'input_tokens', 0) or 0
-                    out = getattr(result.usage, 'output_tokens', 0) or 0
-                    m = self.cache.extract_metrics(result)
-                    cost = self.cache.compute_cost(inp, out, m)
-                    self.em.charge(cost, check=False)  # API 已发生，无条件记账
-                    self.em.spend(cost)
-                    self.em.add_tokens(inp, out)
-                    if m.cache_read_tokens > 0:
-                        print(f"  [Cache] read {m.cache_read_tokens} tokens (saved {m.cache_read_tokens * 0.9:.0f} cost)")
-
-                return result
-
-            except anthropic.RateLimitError:
-                backoff = (2 ** min(attempt, 5)) + random.uniform(0, 1)
-                print(f"  [Rate limit] retry in {backoff:.1f}s ({attempt+1}/{max_retries})...")
-                time.sleep(backoff)
-                if attempt >= max_retries - 1:
-                    raise RuntimeError(f"Rate limited after {max_retries} retries")
-                continue
-
-            except anthropic.APIStatusError as e:
-                if e.status_code in (529, 500, 502, 503, 504):
-                    overload_retries += 1
-                    backoff = min(30, (2 ** min(overload_retries, 5)) * 2) + random.uniform(0, 3)
-                    print(f"  [ServerError {e.status_code}] retry in {backoff:.1f}s ({overload_retries}/{max_overload})...")
-                    time.sleep(backoff)
-                    if overload_retries < max_overload:
-                        continue
-                raise
-
-            except (anthropic.APIConnectionError, TimeoutError) as e:
-                backoff = (2 ** attempt) + random.uniform(0, 2)
-                print(f"  [Timeout/Connection] {type(e).__name__}: retry in {backoff:.1f}s ({attempt+1}/{self.cfg.MAX_RETRIES})...")
-                time.sleep(backoff)
-                continue
-
-            except anthropic.APIError as e:
-                if "too long" in str(e).lower() or "context" in str(e).lower():
-                    raise ContextTooLongError()
-                raise RuntimeError(f"API Error: {e}")
-
-        raise RuntimeError(f"Failed after {self.cfg.MAX_RETRIES} retries")
-
-    def _dump(self, kind: str, data):
-        from datetime import datetime
-        try:
-            self._debug_dir.mkdir(parents=True, exist_ok=True)
-            existing = sorted(self._debug_dir.glob("*.json"))
-            if len(existing) > 200:
-                for old in existing[:50]:
-                    old.unlink()
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = self._debug_dir / f"{kind}_{ts}.json"
-            content = json.dumps(data, default=str, ensure_ascii=False, indent=2)
-            path.write_text(content, encoding='utf-8')
-        except Exception:
-            pass
-
-
-@dataclass
-class CacheMetrics:
-    """Provider-agnostic 缓存指标"""
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
-
-class CacheProvider:
-    """缓存提供商抽象基类。各 provider 实现差异化 token 费率。"""
-    def extract_metrics(self, response) -> CacheMetrics:
-        return CacheMetrics()
-
-    def cache_control(self) -> dict:
-        """返回 cache_control 标记（如 {"type": "ephemeral"}）"""
-        return {}
-
-    def compute_cost(self, input_tokens: int, output_tokens: int,
-                     metrics: CacheMetrics) -> float:
-        """计算含缓存的 token 成本"""
-        return input_tokens * Config.TOKEN_COST_INPUT + output_tokens * Config.TOKEN_COST_OUTPUT
-
-class AnthropicCacheProvider(CacheProvider):
-    """Anthropic 兼容 API 主动缓存：cache_read=0.1x, cache_write=1.25x, 非缓存=1x"""
-    def extract_metrics(self, response) -> CacheMetrics:
-        usage = getattr(response, 'usage', None)
-        if not usage:
-            return CacheMetrics()
-        return CacheMetrics(
-            cache_read_tokens=getattr(usage, 'cache_read_input_tokens', 0) or 0,
-            cache_write_tokens=getattr(usage, 'cache_creation_input_tokens', 0) or 0,
-        )
-
-    def cache_control(self) -> dict:
-        return {"type": "ephemeral"}
-
-    def compute_cost(self, input_tokens: int, output_tokens: int,
-                     metrics: CacheMetrics) -> float:
-        # input_tokens / cache_read / cache_write 三者互不重叠
-        cost = (input_tokens * Config.TOKEN_COST_INPUT      # 非缓存 input
-                + metrics.cache_read_tokens * 0.1           # 缓存读取 0.1x
-                + metrics.cache_write_tokens * 1.25         # 缓存写入 1.25x
-                + output_tokens * Config.TOKEN_COST_OUTPUT) # output
-        return cost
-
-# ============ 原生工具定义 ============
-TOOL_DEFINITIONS = [
-    {
-        "name": "read_file",
-        "description": "Read the contents of a file at the given path. Returns file content as text.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Relative or absolute file path"}
-            },
-            "required": ["path"]
-        }
-    },
-    {
-        "name": "list_dir",
-        "description": "List directory contents. Shows files with sizes and subdirectories.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Directory path", "default": "."}
-            }
-        }
-    },
-    {
-        "name": "write_file",
-        "description": "Create or overwrite a file with the given content.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to write"},
-                "content": {"type": "string", "description": "Content to write"}
-            },
-            "required": ["path", "content"]
-        }
-    },
-    {
-        "name": "view_image",
-        "description": "Analyze an image using a vision model. Supports local file paths and URLs.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Image file path or URL"},
-                "question": {"type": "string", "description": "Question about the image", "default": "Describe the content of this image"}
-            },
-            "required": ["path"]
-        }
-    },
-    {
-        "name": "spawn_agent",
-        "description": "Spawn a sub-agent to independently handle a subtask. The sub-agent gets its own execution context and returns a compressed summary. Use 'explore' mode for uncertain/investigative tasks (high risk, high reward). Use 'exploit' mode for well-understood tasks (low risk, stable).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "The subtask description for the spawned agent"},
-                "context": {"type": "string", "description": "Optional additional context from the parent task"},
-                "mode": {"type": "string", "enum": ["explore", "exploit"], "description": "explore=risky but rewarding on success; exploit=safe and stable. Default: exploit"},
-                "skip_plan": {"type": "boolean", "description": "Skip sub-agent's planning phase (saves 1 API call). Set true for simple, well-defined subtasks.", "default": False}
-            },
-            "required": ["task"]
-        }
-    },
-    {
-        "name": "run_command",
-        "description": "Execute a shell command and return its stdout/stderr. Use for running scripts, installing packages, making HTTP requests, etc. Commands run in the project root directory with a 30-second timeout.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command to execute"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30}
-            },
-            "required": ["command"]
-        }
-    },
-    {
-        "type": "skill_executor",
-        "name": "use_skill",
-        "description": "Activate a loaded skill for the current task. Costs a deposit which is fully refunded on task success, forfeited on failure. Prefer skills over ad-hoc approaches.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "skill_name": {"type": "string", "description": "Name of the skill to activate (must be loaded)"}
-            },
-            "required": ["skill_name"]
-        }
-    },
-    {
-        "name": "recall",
-        "description": (
-            "Recalls archived content by pointer_id or keyword query. "
-            "Use offset/max_tokens to read partial content (demand paging, like mmap). "
-            "Recalling consumes energy proportional to injected tokens. "
-            "Content is marked reclaimable (recycled first on next context pressure)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pointer_id": {
-                    "type": "string",
-                    "description": "Pointer ID to recall, e.g. 'ptr_a1b2c3d4'"
-                },
-                "query": {
-                    "type": "string",
-                    "description": "Keyword search to find pointer IDs when you forgot the exact ID. Returns candidate list with summary and token size."
-                },
-                "offset": {
-                    "type": "integer",
-                    "default": 0,
-                    "description": "Token offset for partial recall (like mmap paging). Default: 0 (start)."
-                },
-                "max_tokens": {
-                    "type": "integer",
-                    "default": 2000,
-                    "description": "Max tokens to inject. Default 2000, max 8000. Prevents token shock."
-                }
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "savepoint",
-        "description": "Savepoint tool for iterative exploration within the current agent. "
-        "create: snapshot current state to disk (one active savepoint per agent). "
-        "commit: keep exploration result as conclusion summary, savepoint becomes history. "
-        "pop: discard exploration, restore to snapshot state, refund all energy spent since create. "
-        "list: show active and historical savepoints. "
-        "Use create before risky/uncertain operations, commit on success, pop on failure to retry differently.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["create", "commit", "pop", "list"],
-                    "description": "create=snapshot state, commit=keep result, pop=restore+refund, list=show all"
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Optional savepoint name (auto-generated if omitted)"
-                },
-                "summary": {
-                    "type": "string",
-                    "description": "Conclusion summary (for commit) or failure reason (for pop)"
-                }
-            },
-            "required": ["action"]
-        }
-    },
-]
-
-# Merge plugin tool definitions
-for _plugin in _PLUGINS:
-    TOOL_DEFINITIONS.extend(_plugin.get_tool_definitions())
-
-def _build_cached_tools(cache_provider: CacheProvider) -> list:
-    """构建带 cache_control 的工具定义（缓存结果，避免重复 deepcopy）"""
-    cc = cache_provider.cache_control()
-    if not cc:
-        return TOOL_DEFINITIONS
-    # 收集需要 cache_control 的工具名前缀
-    cache_prefixes = set()
-    for p in _PLUGINS:
-        cache_prefixes |= p.get_cache_rules()
-    tools = []
-    for t in TOOL_DEFINITIONS:
-        if any(t.get("name", "").startswith(prefix) for prefix in cache_prefixes):
-            tools.append({**t, "cache_control": cc})
-        else:
-            tools.append(t)
-    return tools
-
-def _get_energy_mgr(agent_context: dict) -> 'BayesianEnergyManager':
-    """从 agent_context 中提取能量管理器"""
-    parent = agent_context.get("parent_agent") if agent_context else None
-    return parent.energy_manager if parent else None
-
-
-def energy_hooks(*, deduct=None, settle=None, abort_msg="Insufficient energy"):
-    """通用能量生命周期装饰器。
-
-    Args:
-        deduct: (args, em) -> cost | False — 预扣能量，返回False则中止
-        settle: (args, result, em, cost, agent_context) -> None — 始终执行（finally），用于结算/返费
-        abort_msg: deduct返回False时的错误消息
-    """
-    from functools import wraps
-    def decorator(handler):
-        @wraps(handler)
-        def wrapper(args, budget, agent_context=None):
-            em = _get_energy_mgr(agent_context)
-            cost = None
-            if em and deduct:
-                cost = deduct(args, em)
-                if cost is False:
-                    return {"success": False, "output": abort_msg}
-            result = None
-            try:
-                result = handler(args, budget, agent_context)
-                return result
-            finally:
-                if em and settle:
-                    settle(args, result, em, cost, agent_context)
-        return wrapper
-    return decorator
-
-
-# ── 能量钩子定义 ──
-def _cmd_deduct(args, em):
-    return em.pre_consume_for_cmd(args.get("command", ""))
-
-def _cmd_refund(args, result, em, cost, agent_context=None):
-    if cost and cost > 0:
-        refund = em.refund_for_cmd(
-            args.get("command", ""), cost,
-            result.get("execution_time", 0), result.get("success", False))
-        if refund > 0.01:
-            actual = result.get("execution_time", 0)
-            print(f"  [Energy] +{refund:.1f} refunded ({actual:.1f}s, {'ok' if result['success'] else 'FAIL'})")
-
-def _skill_deduct(args, em):
-    deposit = float(Config.SPAWN_INVEST_MIN)
-    if not em.charge(deposit):
-        return False
-    return deposit
-
-def _spawn_deduct(args, em):
-    if not em.should_spawn():
-        return False
-    invest_amount = max(float(Config.SPAWN_INVEST_MIN), em.energy * 0.05)
-    # Reserve 15% 作为父节点保底
-    reserve = em.energy * Config.SPAWN_RESERVE_RATIO
-    min_threshold = max(em.energy * 0.01, 500)
-    if reserve < min_threshold:
-        return False
-    if not em.charge(invest_amount + reserve):
-        return False
-    em._reserve_stack.append(reserve)
-    print(f"  [Spawn] Reserved: {reserve:.0f}E, invest: {invest_amount:.0f}E, "
-          f"child pool: {em.energy:.0f}")
-    return invest_amount
-
-def _spawn_settle(args, result, em, cost, agent_context=None):
-    if cost is None:
-        return
-    parent_agent = (agent_context or {}).get("parent_agent")
-    spawn_depth = parent_agent.depth + 1 if parent_agent else 1
-    fc = getattr(parent_agent, 'flowchart', None) if parent_agent else None
-    # 释放父节点的保留能量
-    reserve = em._reserve_stack.pop() if em._reserve_stack else 0
-    em.credit(reserve)
-    print(f"  [Spawn] Reserve released: {reserve:.0f}E -> energy {em.energy:.0f}")
-    success = result.get("success", False) if result else False
-    mode = result.get("_mode", "exploit") if result else "exploit"
-    # 结算投资：explore 成功→本金+ROI, 失败→血本无归; exploit 成功→全额返还, 失败→返还50%
-    if mode == "explore":
-        if success:
-            em.credit(cost + cost * em.explore_roi)
-        else:
-            em.spend(cost)
-    else:  # exploit
-        if success:
-            em.credit(cost)
-        else:
-            em.credit(cost * 0.5)
-            em.spend(cost * 0.5)
-    if not success:
-        em.update_spawn(False)
-    if fc:
-        try:
-            fc.record_lifecycle(spawn_depth, release=reserve, settle=cost)
-        except Exception:
-            pass
-
-
-
-
-# ============ Mermaid 流程图记录器 ============
-class FlowchartRecorder:
-    """增量式流程图记录器，每次追加到文件，不重写。"""
-    def __init__(self, work_dir: str):
-        from pathlib import Path
-        self.file_path = Path(work_dir) / "flowchart.md"
-        self.nodes = set()
-        self.edges = set()
-        self.tool_calls: dict[tuple, int] = {}  # (step, tool_name) -> count
-        # spawn 生命周期计数器：合并 absorb/release/settle/exp_prop 为每深度汇总
-        self.spawn_seq: dict[int, int] = {}  # depth -> 序号
-        self._lifecycle: dict[int, dict] = {}  # depth -> {count, full, summary, release, settle, exp, modes}
-        self._init_file()
-
-    def _init_file(self):
-        try:
-            self.file_path.write_text("```mermaid\ngraph TD\n", encoding='utf-8')
-        except Exception:
-            pass
-
-    def _append(self, text: str):
-        try:
-            with open(self.file_path, 'a', encoding='utf-8') as f:
-                f.write(text + "\n")
-        except Exception:
-            pass
-
-    def add_node(self, node_id: str, label: str, shape: str = "rect"):
-        """添加节点。shape: start | end | task | subtask | step | tool | agent | reclaim | truncate | pointer | verify | rect"""
-        if node_id in self.nodes:
-            return
-        self.nodes.add(node_id)
-        indent = "    "
-        # Mermaid classDef suffix for styling
-        cls = f":::{shape}"
-        if shape == "start":
-            line = f'{indent}{node_id}(["{label}"]):::startEnd'
-        elif shape == "end":
-            line = f'{indent}{node_id}(["{label}"]):::startEnd'
-        elif shape == "task":
-            line = f'{indent}{node_id}["{label}"]{cls}'
-        elif shape == "subtask":
-            line = f'{indent}{node_id}["{label}"]{cls}'
-        elif shape == "step":
-            line = f'{indent}{node_id}["{label}"]{cls}'
-        elif shape == "tool":
-            line = f'{indent}{node_id}{{"{label}"}}{cls}'
-        elif shape == "agent":
-            line = f'{indent}{node_id}{{{{"{label}"}}}}{cls}'
-        elif shape == "reclaim":
-            line = f'{indent}{node_id}[/"{label}"/]{cls}'
-        elif shape == "truncate":
-            line = f'{indent}{node_id}{{"{label}"}}{cls}'
-        elif shape == "energy":
-            line = f'{indent}{node_id}("{label}"){cls}'
-        elif shape == "absorb":
-            line = f'{indent}{node_id}[["{label}"]]{cls}'
-        elif shape == "decision":
-            line = f'{indent}{node_id}{{{{"{label}"}}}}{cls}'
-        elif shape == "pointer":
-            line = f'{indent}{node_id}[("{label}")]{cls}'  # cylinder = database
-        elif shape == "verify":
-            line = f'{indent}{node_id}{{"{label}"}}{cls}'  # diamond-ish decision
-        else:
-            line = f'{indent}{node_id}["{label}"]'
-        self._append(line)
-
-    def add_edge(self, from_id: str, to_id: str, label: str = ""):
-        edge = (from_id, to_id, label)
-        if edge in self.edges:
-            return
-        self.edges.add(edge)
-        indent = "    "
-        if label:
-            line = f'{indent}{from_id} -->|{label}| {to_id}'
-        else:
-            line = f'{indent}{from_id} --> {to_id}'
-        self._append(line)
-
-
-    def merged_tool(self, from_id: str, tool_name: str, step_counter: int, depth: int = 0,
-                    success: bool = True) -> str:
-        """同一 step 内合并同名工具调用，首次创建节点，后续只计数。
-        success 控制节点后缀：✓ 绿 / ✗ 红。
-        返回节点 ID（用于后续连接）。
-        """
-        key = (depth, step_counter, tool_name)
-        self.tool_calls[key] = self.tool_calls.get(key, 0) + 1
-        count = self.tool_calls[key]
-        node_id = f"tool_d{depth}_{step_counter}_{tool_name}"
-        status_tag = " ✓" if success else " ✗"
-        label = f"{tool_name} (x{count}){status_tag}"
-        if count == 1:
-            # 首次调用：创建节点并连接
-            self.add_node(node_id, f"工具: {label}", shape="tool")
-            self.add_edge(from_id, node_id)
-        else:
-            # 更新已有节点的 label（追加失败标记）
-            shape_cls = "tool"
-            # Mermaid 不支持更新节点，用 classDef toolFail 区分
-            if not success:
-                self._append(f"    class {node_id} toolFail")
-        return node_id
-
-    def add_note(self, node_id: str, note: str):
-        """为节点添加注释"""
-        self._append(f'    note for {node_id} "{note}"')
-
-    def update_subtask_status(self, sub_node: str, desc: str, success: bool):
-        """更新子任务节点的完成状态。Mermaid 不支持更新，追加状态标注节点。"""
-        if sub_node not in self.nodes:
-            return
-        tag = " ✓" if success else " ✗"
-        status_node = f"{sub_node}_status"
-        # 追加一个状态节点，连到子任务节点
-        self.add_node(status_node, f"{desc[:20]}{tag}", shape="subtask")
-        self.add_edge(sub_node, status_node, label="结果")
-        if not success:
-            self._append(f"    class {status_node} toolFail")
-
-    def next_spawn_seq(self, depth: int) -> int:
-        """返回该深度下一个 spawn 序号（1-based）"""
-        self.spawn_seq[depth] = self.spawn_seq.get(depth, 0) + 1
-        return self.spawn_seq[depth]
-
-    def record_lifecycle(self, depth: int, **kw):
-        """累加 spawn 生命周期事件，finalize 时统一写入汇总节点。
-        kw: spawn=1, absorb_full=1, absorb_summary=1, release=float, settle=float, exp=int, mode=str
-        """
-        if depth not in self._lifecycle:
-            self._lifecycle[depth] = {
-                "count": 0, "full": 0, "summary": 0,
-                "release": 0.0, "settle": 0.0, "exp": 0, "modes": []
-            }
-        d = self._lifecycle[depth]
-        if "spawn" in kw:
-            d["count"] += kw["spawn"]
-        if "absorb_full" in kw:
-            d["full"] += 1
-        if "absorb_summary" in kw:
-            d["summary"] += 1
-        if "release" in kw:
-            d["release"] += kw["release"]
-        if "settle" in kw:
-            d["settle"] += kw["settle"]
-        if "exp" in kw:
-            d["exp"] += kw["exp"]
-        if "mode" in kw:
-            d["modes"].append(kw["mode"])
-
-    def finalize(self):
-        # 写入每深度 spawn 生命周期汇总节点
-        for depth in sorted(self._lifecycle):
-            d = self._lifecycle[depth]
-            if d["count"] == 0:
-                continue
-            explore_n = d["modes"].count("explore")
-            exploit_n = d["modes"].count("exploit")
-            parts = [f"{d['count']}次spawn"]
-            if explore_n:
-                parts.append(f"{explore_n}探索")
-            if exploit_n:
-                parts.append(f"{exploit_n}利用")
-            if d["full"]:
-                parts.append(f"{d['full']}完整吸收")
-            if d["summary"]:
-                parts.append(f"{d['summary']}摘要吸收")
-            if d["release"] > 0:
-                parts.append(f"释放{d['release']:.0f}E")
-            if d["exp"] > 0:
-                parts.append(f"经验{d['exp']}条")
-            label = f"深度{depth} 生命周期: {', '.join(parts)}"
-            node_id = f"lifecycle_d{depth}"
-            self.add_node(node_id, label, shape="energy")
-        # 样式定义
-        self._append("    classDef startEnd fill:#e1f5e1,stroke:#2e7d32,stroke-width:2px")
-        self._append("    classDef task fill:#fff3e0,stroke:#ef6c00,stroke-width:2px")
-        self._append("    classDef step fill:#e3f2fd,stroke:#1565c0,stroke-width:1px")
-        self._append("    classDef tool fill:#fce4ec,stroke:#c2185b,stroke-width:1px")
-        self._append("    classDef toolFail fill:#ffcdd2,stroke:#b71c1c,stroke-width:2px")
-        self._append("    classDef agent fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px")
-        self._append("    classDef reclaim fill:#ffebee,stroke:#c62828,stroke-width:1px,stroke-dasharray: 5 5")
-        self._append("    classDef truncate fill:#fffde7,stroke:#f9a825,stroke-width:1px,stroke-dasharray: 3 3")
-        self._append("    classDef energy fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px")
-        self._append("    classDef pointer fill:#e0f7fa,stroke:#00838f,stroke-width:1px")
-        self._append("    classDef verify fill:#fbe9e7,stroke:#d84315,stroke-width:2px")
-        self._append("    classDef decision fill:#fff8e1,stroke:#ff8f00,stroke-width:2px")
-        self._append("```")
-
-
-# ============ 事件总线 ============
-
-class AgentEventBus:
-    """Simple event bus for decoupling components within the agent."""
-
-    def __init__(self):
-        self._subscribers: dict[str, list[callable]] = {}
-
-    def subscribe(self, event_type: str, handler: callable):
-        self._subscribers.setdefault(event_type, []).append(handler)
-
-    def emit(self, event_type: str, data: dict):
-        for handler in self._subscribers.get(event_type, []):
-            try:
-                handler(data)
-            except Exception as e:
-                print(f"[EventBus] Handler error for '{event_type}': {e}")
-
-
-# Shared event bus — initialized in Agent.__init__
-_EVENT_BUS: AgentEventBus | None = None
-
-
-def _get_event_bus() -> AgentEventBus:
-    global _EVENT_BUS
-    if _EVENT_BUS is None:
-        _EVENT_BUS = AgentEventBus()
-    return _EVENT_BUS
-
-
-# ============ 工具执行器 ============
-class ToolExecutor:
-    @staticmethod
-    def execute(name: str, args: Dict[str, Any], budget: int,
-                agent_context: dict = None) -> Dict[str, Any]:
-        handlers = {
-            "read_file": ToolExecutor._read_file,
-            "list_dir": ToolExecutor._list_dir,
-            "write_file": ToolExecutor._write_file,
-            "view_image": ToolExecutor._view_image,
-            "spawn_agent": energy_hooks(deduct=_spawn_deduct, settle=_spawn_settle,
-                                        abort_msg="Insufficient energy to spawn sub-agent")(ToolExecutor._spawn_agent),
-            "run_command": energy_hooks(deduct=_cmd_deduct, settle=_cmd_refund)(ToolExecutor._run_command),
-            "use_skill": energy_hooks(deduct=_skill_deduct,
-                                      abort_msg="Insufficient energy for skill deposit")(ToolExecutor._use_skill),
-            "savepoint": ToolExecutor._savepoint,
-            "recall": ToolExecutor._recall,
-        }
-        # Merge plugin handlers
-        for plugin in _PLUGINS:
-            handlers.update(plugin.get_tool_handlers())
-
-        handler = handlers.get(name)
-        if not handler:
-            return {"success": False, "output": f"Unknown tool: {name}. Available: {', '.join(handlers.keys())}"}
-        try:
-            result = handler(args, budget, agent_context or {})
-            # ── 记录 tool 调用序列（供技能保存）──
-            parent = (agent_context or {}).get("parent_agent")
-            if parent and hasattr(parent, "_current_tool_calls"):
-                record = {
-                    "tool": name,
-                    "action": args.get("action", ""),
-                    "params": {k: v for k, v in args.items() if k != "action"},
-                    "success": result.get("success", False),
-                    "timestamp": time.time(),
-                }
-                # Track IK fallback for reward penalty
-                if result.get("ik_fallback"):
-                    record["ik_fallback"] = True
-                    record["requested_direction"] = result.get("requested_direction", "")
-                    record["actual_direction"] = result.get("approach_direction", "")
-                # Track verified field for task verification
-                if "verified" in result:
-                    record["verified"] = result["verified"]
-                parent._current_tool_calls.append(record)
-
-            # Plugin post-tool hook (IK settlement, etc.)
-            if parent:
-                for plugin in _PLUGINS:
-                    plugin.on_tool_executed(parent, name, result)
-
-            return result
-        except Exception as e:
-            return {"success": False, "output": f"Tool error: {e}"}
-
-    def _read_file(args: dict, budget: int, agent_context: dict = None) -> dict:
-        path = args.get("path", "")
-        if not path:
-            return {"success": False, "output": "Missing path parameter"}
-        path = str(path)
-        if not os.path.exists(path):
-            return {"success": False, "output": f"File not found: {path}"}
-        if os.path.isdir(path):
-            return {"success": False, "output": f"Is a directory: {path}, use list_dir"}
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read()
-        total = len(content)
-        output = smart_truncate(content, budget, label=f"{os.path.basename(path)} ")
-        return {"success": True, "output": output, "truncated": total > budget, "original_size": total}
-
-    @staticmethod
-    def _list_dir(args: dict, budget: int, agent_context: dict = None) -> dict:
-        path = str(args.get("path", "."))
-        if not os.path.exists(path):
-            return {"success": False, "output": f"Path not found: {path}"}
-        if not os.path.isdir(path):
-            return {"success": False, "output": f"Not a directory: {path}"}
-        entries = []
-        for entry in sorted(os.listdir(path)):
-            full = os.path.join(path, entry)
-            if os.path.isdir(full):
-                entries.append(f"  {entry}/")
-            else:
-                size = os.path.getsize(full)
-                entries.append(f"  {entry}  ({size} bytes)")
-        output = "\n".join(entries) or "(empty)"
-        return {"success": True, "output": smart_truncate(output, budget, label="dir ")}
-
-    @staticmethod
-    def _write_file(args: dict, budget: int, agent_context: dict = None) -> dict:
-        path = args.get("path", "")
-        content = args.get("content", "")
-        if not path:
-            return {"success": False, "output": "Missing path parameter"}
-        path = str(path)
-        # 脚本文件自动路由到 scripts/ 目录
-        if path.endswith(('.py', '.sh', '.bat', '.ps1')) and not os.path.dirname(path):
-            scripts_dir = Path(Config.SCRIPTS_DIR)
-            scripts_dir.mkdir(parents=True, exist_ok=True)
-            path = str(scripts_dir / path)
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(str(content))
-        # 更新共享文件缓存（供子 agent 直接复用）
-        if agent_context:
-            parent_agent = agent_context.get("parent_agent")
-            if parent_agent and hasattr(parent_agent, 'shared_files'):
-                rel = os.path.relpath(path, parent_agent.work_dir)
-                parent_agent.shared_files[rel] = os.path.abspath(path)
-        return {"success": True, "output": f"Wrote {path} ({len(str(content))} chars). Run with: {path}"}
-
-    @staticmethod
-    def _view_image(args: dict, budget: int, agent_context: dict = None) -> dict:
-        """调用 MiniMax VLM API 分析图片（伪装 MCP 来源）"""
-        import requests as _req
-        import base64
-        # 禁用代理 — requests 默认读取 HTTP_PROXY，会阻断内网 API 调用
-        _NO_PROXY = {"http": None, "https": None}
-        path = args.get("path", "")
-        prompt = args.get("question", "Describe the content of this image in detail")
-        if not path:
-            return {"success": False, "output": "Missing path parameter"}
-        path = str(path)
-        is_url = path.startswith(("http://", "https://"))
-        if not is_url and not os.path.exists(path):
-            return {"success": False, "output": f"File not found: {path}"}
-        try:
-            # 图片 → base64 data URL
-            if is_url:
-                resp = _req.get(path, timeout=15, proxies=_NO_PROXY)
-                resp.raise_for_status()
-                ct = resp.headers.get("content-type", "").lower()
-                fmt = "png" if "png" in ct else "webp" if "webp" in ct else "jpeg"
-                b64 = base64.b64encode(resp.content).decode()
-            else:
-                ext = os.path.splitext(path)[1].lower()
-                fmt = ".png" if ext == ".png" else ".webp" if ext == ".webp" else "jpeg"
-                with open(path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode()
-            data_url = f"data:image/{fmt};base64,{b64}"
-            # 调 MiniMax VLM（伪装 MCP）
-            r = _req.post(
-                f"{Config.MINIMAX_API_HOST}/v1/coding_plan/vlm",
-                json={"prompt": prompt, "image_url": data_url},
-                headers={
-                    "Authorization": f"Bearer {Config.ANTHROPIC_API_KEY}",
-                    "Content-Type": "application/json",
-                    "MM-API-Source": "Minimax-MCP",
-                },
-                timeout=30,
-                proxies=_NO_PROXY,
-            )
-            r.raise_for_status()
-            data = r.json()
-            content = data.get("content", "")
-            if not content:
-                return {"success": False, "output": f"VLM returned empty: {data}"}
-            return {"success": True, "output": smart_truncate(content, budget, label="image ")}
-        except Exception as e:
-            return {"success": False, "output": f"Image analysis error: {e}"}
-
-    @staticmethod
-    def _run_command(args: dict, budget: int, agent_context: dict = None) -> dict:
-        """执行 shell 命令（纯执行，能量预扣/返还由 execute 层处理）"""
-        command = args.get("command", "")
-        timeout = min(args.get("timeout", 30), 60)
-        if not command:
-            return {"success": False, "output": "Missing command parameter", "execution_time": 0}
-
-        start_time = time.time()
-        try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                encoding='utf-8', errors='replace', timeout=timeout,
-                cwd=os.getcwd(),
-                env={**os.environ, "PYTHONIOENCODING": "utf-8", "LANG": "en_US.UTF-8"}
-            )
-            actual_seconds = time.time() - start_time
-            cmd_success = result.returncode == 0
-            output = ""
-            if result.stdout:
-                output += result.stdout
-            if result.stderr:
-                stderr_clean = result.stderr[:500]
-                output += ("\nSTDERR:\n" + stderr_clean) if output else stderr_clean
-            if not output:
-                output = f"(exit code {result.returncode}, no output)"
-            return {"success": cmd_success, "output": smart_truncate(output, budget, label="cmd "),
-                    "exit_code": result.returncode, "execution_time": actual_seconds}
-        except subprocess.TimeoutExpired:
-            return {"success": False, "output": f"Command timed out after {timeout}s",
-                    "execution_time": timeout}
-        except Exception as e:
-            return {"success": False, "output": f"Command error: {e}",
-                    "execution_time": time.time() - start_time}
-
-    @staticmethod
-    def _use_skill(args: dict, budget: int, agent_context: dict) -> dict:
-        """激活 Skill（纯逻辑，押金由 execute 层处理）"""
-        skill_name = args.get("skill_name", "")
-        if not skill_name:
-            return {"success": False, "output": "Missing skill_name parameter"}
-        parent = agent_context.get("parent_agent") if agent_context else None
-        if not parent:
-            return {"success": False, "output": "No agent context"}
-        # 检查 Skill 是否已加载
-        loaded = [s.name for s in parent.active_skills]
-        if skill_name not in loaded:
-            available = ", ".join(loaded) if loaded else "(none loaded)"
-            return {"success": False, "output": f"Skill '{skill_name}' not loaded. Available: {available}"}
-        # 将 Skill 内容注入到约束帧（如果尚未包含完整内容）
-        for skill in parent.active_skills:
-            if skill.name == skill_name:
-                constraint = parent.stack[0].content
-                if skill.content not in constraint:
-                    parent.stack[0] = StackFrame("constraint",
-                                                  constraint + f"\n\n## Skill: {skill.name}\n{skill.content}", level=0)
-                break
-        return {"success": True, "output": f"Skill '{skill_name}' activated."}
-
-    @staticmethod
-    def _recall(args: dict, budget: int, agent_context: dict = None) -> dict:
-        """Recall archived content by pointer_id or keyword query."""
-        parent = (agent_context or {}).get("parent_agent")
-        if not parent or not hasattr(parent, 'pointer_store'):
-            return {"success": False, "output": "Pointer store not available"}
-
-        pointer_id = args.get("pointer_id", "")
-        query = args.get("query", "")
-        offset = int(args.get("offset", 0))
-        max_tokens = min(int(args.get("max_tokens", Config.RECALL_DEFAULT_TOKENS)),
-                         Config.RECALL_MAX_TOKENS)
-
-        # 模式 1: 关键词搜索
-        if query and not pointer_id:
-            results = parent.pointer_store.search_keywords(query, parent.scope, limit=5)
-            if not results:
-                return {"success": True, "output": "No matching pointers found."}
-            lines = ["## Matching Pointers\n"]
-            for r in results:
-                lines.append(f"- `{r['id']}`: {r['summary'][:120]} ({r['tokens']} tokens, used {r['use_count']}x)")
-            return {"success": True, "output": "\n".join(lines)}
-
-        # 模式 2: 精确召回
-        if not pointer_id:
-            return {"success": False, "output": "Provide pointer_id or query"}
-
-        result = parent.pointer_store.recall(
-            pointer_id, scope=parent.scope,
-            offset=offset, max_tokens=max_tokens,
-        )
-        if result is None:
-            return {"success": False, "output": f"Pointer '{pointer_id}' not found or scope inaccessible."}
-
-        content, meta = result
-        injected_tokens = meta["injected_tokens"]
-
-        # 流程图：RECALL 节点
-        if parent.flowchart:
-            try:
-                fc_step = getattr(parent, '_current_step_node', None)
-                if fc_step:
-                    ptr_node = f"ptr_recall_{parent.depth}_{parent.agent_id}_{pointer_id}"
-                    parent.flowchart.add_node(
-                        ptr_node,
-                        f"RECALL {pointer_id} ({injected_tokens}E)",
-                        shape="pointer")
-                    parent.flowchart.add_edge(fc_step, ptr_node, label="召回")
-            except Exception:
-                pass
-
-        # 消耗能量（recall = swap in，有代价）
-        if injected_tokens > 0:
-            parent.energy_manager.charge(injected_tokens)
-
-        # 标记原始 pointer 帧为 reclaimable
-        for f in parent.stack:
-            if getattr(f, 'pointer_id', '') == pointer_id:
-                f.reclaimable = True
-                break
-
-        # 注入 reclaimable 帧到栈
-        parent.stack.append(StackFrame(
-            "step_detail", content,
-            step_id=meta.get("step_id", 0),
-            level=2, agent_id=parent.agent_id,
-            pointer_id=pointer_id, reclaimable=True,
-            use_count=1, last_used_step=parent.step_counter,
-        ))
-
-        output = smart_truncate(content, budget, label="recall ")
-        if meta["truncated"]:
-            output += f"\n\n... [内容已截断，共 {meta['tokens']} tokens，offset={offset + max_tokens} 可继续召回] ..."
-        output += f"\n\n[Recalled {injected_tokens} tokens from {pointer_id}, -{injected_tokens}E charged. Content is reclaimable.]"
-        print(f"  [Recall] {pointer_id}: {injected_tokens} tokens injected, -{injected_tokens}E charged")
-        return {"success": True, "output": output}
-
-    @staticmethod
-    def _savepoint(args: dict, budget: int, agent_context: dict = None) -> dict:
-        """存档点工具 — create / commit / pop / list"""
-        action = args.get("action", "list")
-        agent = (agent_context or {}).get("parent_agent")
-        if not agent:
-            return {"success": False, "output": "No agent context — savepoint requires a running agent"}
-
-        if action == "create":
-            return SavepointManager.create(agent, args.get("name", None))
-        elif action == "commit":
-            return SavepointManager.commit(agent, args.get("summary", ""))
-        elif action == "pop":
-            return SavepointManager.pop(agent, args.get("reason", ""))
-        elif action == "list":
-            return SavepointManager.list_savepoints(agent)
-        else:
-            return {"success": False,
-                    "output": f"Unknown savepoint action: {action}. Use create/commit/pop/list"}
-
-    @staticmethod
-    def _spawn_agent(args: dict, budget: int, agent_context: dict) -> dict:
-        """派生子 Agent（纯执行，能量由装饰器管理）"""
-        task = args.get("task", "")
-        context = args.get("context", "")
-        if not task:
-            return {"success": False, "output": "Missing task parameter", "_mode": "exploit"}
-
-        current_depth = agent_context.get("depth", 0)
-        if Config.MAX_SPAWN_DEPTH > 0 and current_depth >= Config.MAX_SPAWN_DEPTH:
-            return {"success": False, "output": f"Maximum spawn depth ({Config.MAX_SPAWN_DEPTH}) reached", "_mode": "exploit"}
-
-        parent_agent = agent_context.get("parent_agent")
-        energy_mgr = parent_agent.energy_manager if parent_agent else None
-
-        # 能量感知：决定 explore/exploit 模式
-        llm_specified_mode = "mode" in args
-        base_mode = args.get("mode", "exploit")
-        if energy_mgr and not llm_specified_mode:
-            explore_prob = energy_mgr.get_role_probability()
-            mode = "explore" if random.random() < explore_prob else "exploit"
-        elif energy_mgr and llm_specified_mode:
-            explore_prob = energy_mgr.get_role_probability()
-            suggested = "explore" if random.random() < explore_prob else "exploit"
-            if suggested != base_mode:
-                print(f"  [EnergyAware] LLM={base_mode}, energy suggests {suggested} (p_explore={explore_prob:.2f})")
-            mode = base_mode
-        else:
-            mode = base_mode
-
-        try:
-            child_system = agent_context.get("system_prompt", "你是一个AI编程助手。")
-            child = Agent(
-                system_prompt=child_system,
-                depth=current_depth + 1,
-                parent=parent_agent
-            )
-            # 记录子 Agent 节点（带序号）
-            spawn_node = f"spawn_{current_depth+1}_{child.agent_id}"
-            args["_child_id"] = child.agent_id  # 供 spawn_settle 定位节点
-            if parent_agent and hasattr(parent_agent, 'flowchart'):
-                try:
-                    seq = parent_agent.flowchart.next_spawn_seq(current_depth + 1)
-                    mode_tag = "🔍" if mode == "explore" else "🔧"
-                    parent_agent.flowchart.add_node(spawn_node, f"子 Agent #{seq} (深度 {current_depth+1}, {mode_tag}{mode})", shape="agent")
-                    current_step = getattr(parent_agent, "_current_step_node", None)
-                    if current_step:
-                        parent_agent.flowchart.add_edge(current_step, spawn_node)
-                    # 传递 spawn 节点给子 Agent，使其步骤挂在该节点下
-                    child._fc_parent_spawn_node = spawn_node
-                    # 记录 spawn 生命周期事件
-                    parent_agent.flowchart.record_lifecycle(current_depth + 1, spawn=1, mode=mode)
-                except Exception:
-                    pass
-
-            child.emit_event(SubAgentEventType.STARTED, f"Spawning ({mode}) for: {task[:50]}")
-            # 传递父级 context
-            if context:
-                child.stack.append(StackFrame("history", f"Parent context: {context}", level=0))
-            # 共享文件路径（父已完成文件，子可直接读）
-            if parent_agent and parent_agent.shared_files:
-                files_lines = ["## Shared files (completed by parent agents):"]
-                for rel, abspath in parent_agent.shared_files.items():
-                    files_lines.append(f"- {rel}: {abspath}")
-                child.stack.append(StackFrame("history", "\n".join(files_lines), level=0))
-            # Skills 继承（单例 SkillManager 只加载一次，auto_skill 只在顶层匹配）
-            if parent_agent and parent_agent.active_skills:
-                skill_lines = ["## Skills (inherited from parent):"]
-                for s in parent_agent.active_skills:
-                    skill_lines.append(f"### {s.name}\n{s.content}")
-                child.stack.append(StackFrame("history", "\n".join(skill_lines), level=0))
-            # 失败经验传递：将父级最近的失败工具调用告知子 Agent
-            if parent_agent:
-                parent_frame = parent_agent._build_failure_experience()
-                if parent_frame:
-                    child.stack.append(StackFrame("experience", parent_frame, level=0))
-
-            # 继承父级 skip_plan 决策：显式参数 > 父级决策 > False
-            inherit_skip = args.get("skip_plan", False) or getattr(parent_agent, '_skip_plan_resolved', False)
-            result = child.run(task, max_steps=Config.MAX_STEPS, skip_plan=inherit_skip)
-            child.emit_event(SubAgentEventType.TASK_COMPLETED, f"Completed: {task[:50]}")
-
-            if energy_mgr:
-                energy_mgr.update_spawn(True)
-
-            # 子 Agent 结果吸收：父 Agent 根据能量决定保留完整内容或仅摘要
-            output = result or "(no output)"
-            if parent_agent:
-                parent_agent._absorb_child_result(output, task)
-                # 子 Agent 的经验上提到父 Agent，最终由根 Agent 统一 flush
-                if child._pending_experiences:
-                    n = len(child._pending_experiences)
-                    parent_agent._pending_experiences.extend(child._pending_experiences)
-                    parent_agent._save_pending_experiences()
-                    print(f"  [Experience] propagated {n} records from child")
-                    child._pending_experiences = []
-                    # 生命周期计数器：经验上提
-                    if parent_agent.flowchart:
-                        try:
-                            parent_agent.flowchart.record_lifecycle(child.depth, exp=n)
-                        except Exception:
-                            pass
-            return {"success": True, "output": smart_truncate(output, budget, label="sub-agent "),
-                    "_mode": mode}
-        except Exception as e:
-            if parent_agent:
-                parent_agent.energy_manager.process_event(
-                    SubAgentEvent("child", SubAgentEventType.FATAL_ERROR, str(e)))
-            return {"success": False, "output": f"Sub-agent error: {e}", "_mode": mode}
-
-
-# ============ 存档点系统 ============
-class SavepointManager:
-    """存档点管理器 — 支持 agent 内部迭代探索。
-
-    每个 agent 只有一个活跃存档点。
-    历史存档点按 context_size 排序，驱逐时优先回收最大的。
-
-    create → 快照当前状态到磁盘，扣除备份能量
-    commit → 保留结论摘要，存档点进入历史
-    pop → 从磁盘恢复快照，返还探索消耗的能量
-    """
-
-    @staticmethod
-    def _dir(agent) -> str:
-        d = os.path.join(Config.SAVEPOINT_DIR, agent.agent_id)
-        os.makedirs(d, exist_ok=True)
-        return d
-
-    @staticmethod
-    def create(agent, name: str = None) -> dict:
-        if agent.active_savepoint is not None:
-            return {"success": False, "output": f"已有活跃存档点 '{agent.active_savepoint.name}'，请先 commit 或 pop"}
-
-        name = name or f"sp_{agent.step_counter}_{int(time.time()) % 10000}"
-        save_dir = SavepointManager._dir(agent)
-        path = os.path.join(save_dir, f"{name}.json")
-
-        # 全量快照
-        snapshot = {
-            "stack": [asdict(f) for f in agent.stack],
-            "step_counter": agent.step_counter,
-            "subtask_queue": agent.subtask_queue,
-            "conversation_history": agent.conversation_history,
-            "_verify_feedback": list(agent._verify_feedback),
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, indent=2, ensure_ascii=False)
-
-        # 估算当前上下文大小
-        ctx_chars = sum(len(fr.content) for fr in agent.stack)
-        ctx_tokens_est = ctx_chars // 4
-
-        sp = SavepointMeta(
-            name=name, path=path, agent_id=agent.agent_id,
-            status="active",
-            energy_at_save=agent.energy_manager.energy,
-            total_spent_at_save=agent.energy_manager.total_spent,
-            step_counter_at_save=agent.step_counter,
-            context_chars_at_save=ctx_chars,
-            context_size=ctx_tokens_est,
-            created_at=time.time(),
-        )
-        agent.active_savepoint = sp
-
-        # 扣除备份能量（快照占用 context 的估算成本）
-        backup_cost = ctx_tokens_est * Config.TOKEN_COST_INPUT * 0.1
-        agent.energy_manager.charge(backup_cost, check=False)
-        agent.energy_manager.spend(backup_cost)
-
-        print(f"  [Savepoint] Created '{name}' at step {agent.step_counter}, "
-              f"energy={sp.energy_at_save:.0f}E, ctx≈{ctx_tokens_est} tokens, "
-              f"backup_cost={backup_cost:.0f}E")
-        return {"success": True, "output": f"Savepoint '{name}' created (step {agent.step_counter}, "
-                                          f"energy {sp.energy_at_save:.0f}E, "
-                                          f"ctx ~{ctx_tokens_est} tokens)"}
-
-    @staticmethod
-    def commit(agent, summary: str = "") -> dict:
-        sp = agent.active_savepoint
-        if sp is None:
-            return {"success": False, "output": "No active savepoint to commit"}
-
-        sp.status = "committed"
-        sp.summary = summary or "(no summary)"
-
-        # 结论摘要入栈（极小上下文开销）
-        conclusion = f"[Savepoint '{sp.name}' committed] {sp.summary}"
-        agent.stack.append(StackFrame("summary", conclusion,
-                                       agent.step_counter, level=2,
-                                       agent_id=agent.agent_id))
-
-        # 移入历史（不活跃）
-        agent.savepoint_history.append(sp)
-        agent.active_savepoint = None
-
-        print(f"  [Savepoint] Committed '{sp.name}': {sp.summary[:80]}")
-        return {"success": True, "output": f"Savepoint '{sp.name}' committed. Summary: {sp.summary[:200]}"}
-
-    @staticmethod
-    def pop(agent, reason: str = "") -> dict:
-        sp = agent.active_savepoint
-        if sp is None:
-            return {"success": False, "output": "No active savepoint to pop"}
-
-        # 从磁盘读取快照
-        try:
-            with open(sp.path, "r", encoding="utf-8") as f:
-                snapshot = json.load(f)
-        except Exception as e:
-            return {"success": False, "output": f"Failed to load snapshot: {e}"}
-
-        # 计算返还能量
-        energy_before_pop = agent.energy_manager.energy
-        energy_spent_during = sp.energy_at_save - energy_before_pop
-        refund_amount = max(0, energy_spent_during)
-
-        total_spent_during = agent.energy_manager.total_spent - sp.total_spent_at_save
-
-        # 恢复状态
-        agent.stack = deque([StackFrame(**frame) for frame in snapshot["stack"]])
-        agent.step_counter = snapshot["step_counter"]
-        agent.subtask_queue = snapshot["subtask_queue"]
-        agent.conversation_history = snapshot["conversation_history"]
-        agent._verify_feedback = snapshot.get("_verify_feedback", [])
-
-        # 返还探索消耗的能量（context 已释放）
-        agent.energy_manager.energy = sp.energy_at_save
-        # total_spent 不回调（API 已实际消耗），但流动资金恢复
-
-        # 标记存档点被弹出，移入历史
-        sp.status = "popped"
-        sp.summary = reason or "(no reason)"
-        sp.context_size = 0  # 几乎不占 context（只有 reason 字符串）
-        agent.savepoint_history.append(sp)
-        agent.active_savepoint = None
-
-        # 通知 tool loop 停止（状态已恢复，下一步直接使用新栈）
-        agent._just_popped = True
-
-        print(f"  [Savepoint] POPPED '{sp.name}': {reason[:80] if reason else 'no reason'}. "
-              f"Refunded {refund_amount:.0f}E (spent {energy_spent_during:.0f}E during exploration, "
-              f"total_spent={total_spent_during:.0f}E consumed)")
-        return {"success": True,
-                "output": f"Savepoint '{sp.name}' popped. Energy refunded: {refund_amount:.0f}E. "
-                          f"Reason: {sp.summary[:200]}"}
-
-    @staticmethod
-    def list_savepoints(agent) -> dict:
-        lines = []
-        if agent.active_savepoint:
-            sp = agent.active_savepoint
-            lines.append(f"[ACTIVE] {sp.name} (step {sp.step_counter_at_save}, "
-                        f"energy_at_save={sp.energy_at_save:.0f}E, "
-                        f"ctx≈{sp.context_chars_at_save} chars)")
-        if agent.savepoint_history:
-            # 按 context_size 降序列出
-            sorted_hist = sorted(agent.savepoint_history,
-                                key=lambda s: s.context_size, reverse=True)
-            lines.append(f"--- History ({len(sorted_hist)}) ---")
-            for sp in sorted_hist:
-                lines.append(f"  [{sp.status.upper()}] {sp.name}: {sp.summary[:60]}")
-        if not lines:
-            lines.append("(no savepoints)")
-        return {"success": True, "output": "\n".join(lines)}
-
-
-# ============ Skill 系统 ============
-class Skill:
-    def __init__(self, name: str, description: str, keywords: list[str], content: str):
-        self.name = name
-        self.description = description
-        self.keywords = keywords
-        self.content = content
-
-class SkillManager:
-    _skills_cache: Dict[str, 'Skill'] = {}
-    _loaded = False
-
-    def __init__(self, skills_dir: str = None):
-        self.skills_dir = Path(skills_dir or Config.SKILLS_DIR)
-        self.skills = SkillManager._skills_cache
-        if not SkillManager._loaded:
-            self._load_all()
-            SkillManager._loaded = True
-
-    def _load_all(self):
-        if not self.skills_dir.exists():
-            return
-        for skill_path in sorted(self.skills_dir.iterdir()):
-            if not skill_path.is_dir():
-                continue
-            md_file = skill_path / "SKILL.md"
-            if not md_file.exists():
-                continue
-            try:
-                skill = self._parse(md_file)
-                self.skills[skill.name] = skill
-                print(f"  [Skill] {skill.name}: {skill.description[:50]}")
-            except Exception as e:
-                print(f"  [Skill] parse failed {md_file.name}: {e}")
-
-    @staticmethod
-    def _parse(filepath: Path) -> Skill:
-        text = filepath.read_text(encoding='utf-8')
-        m = re.match(r'^---\s*\n(.*?)\n---\s*\n(.*)', text, re.DOTALL)
-        if not m:
-            raise ValueError("Missing frontmatter")
-        meta_text, body = m.group(1), m.group(2).strip()
-        meta = {}
-        for line in meta_text.split('\n'):
-            if ':' in line:
-                k, v = line.split(':', 1)
-                meta[k.strip()] = v.strip()
-        name = meta.get('name', filepath.parent.name)
-        desc = meta.get('description', '')
-        kw_str = meta.get('keywords', '')
-        keywords = [k.strip().lower() for k in kw_str.split(',') if k.strip()]
-        return Skill(name, desc, keywords, body)
-
-    def get(self, name: str) -> Optional[Skill]:
-        return self.skills.get(name)
-
-    def match(self, task: str, top_n: int = 1) -> list[Skill]:
-        task_lower = task.lower()
-        scored = []
-        for skill in self.skills.values():
-            score = 0
-            if skill.name.lower() in task_lower:
-                score += 10
-            for kw in skill.keywords:
-                if kw in task_lower:
-                    score += 3
-            for word in skill.description.lower().split():
-                if len(word) > 2 and word in task_lower:
-                    score += 1
-            if score > 0:
-                scored.append((score, skill))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [s for _, s in scored[:top_n]]
-
-    def list_names(self) -> list[str]:
-        return list(self.skills.keys())
-
-# ============ 异常 ============
-class ContextTooLongError(Exception):
-    pass
-
-# ============ 贝叶斯步数预估器 ============
-class StepEstimator:
-    """Gamma-Exponential 共轭：根据已完成子任务步数预测剩余步数"""
-    def __init__(self, total_subtasks: int, prior_mean: float = 3.0, prior_strength: float = 1.0):
-        self.N = total_subtasks
-        self.alpha = prior_mean * prior_strength
-        self.beta = prior_strength
-        self.completed = 0
-
-    def update(self, steps_taken: int):
-        self.alpha += steps_taken
-        self.beta += 1
-        self.completed += 1
-
-    def predict_remaining(self) -> tuple:
-        """返回 (期望, 下限5%, 上限95%)"""
-        remaining = self.N - self.completed
-        if remaining <= 0:
-            return 0, 0, 0
-        shape = remaining * self.alpha
-        rate = self.beta
-        mean = shape / rate
-        std = math.sqrt(shape) / rate
-        return mean, max(0, mean - 1.645 * std), mean + 1.645 * std
-
-    def predict_total(self, steps_done: int) -> tuple:
-        rem_mean, rem_low, rem_high = self.predict_remaining()
-        return steps_done + rem_mean, steps_done + rem_low, steps_done + rem_high
-
-# ============ 子 Agent 事件系统 ============
-class SubAgentEventType(Enum):
-    STARTED = auto()
-    STEP_COMPLETED = auto()
-    TOOL_FAILED = auto()
-    FATAL_ERROR = auto()
-    TASK_COMPLETED = auto()
-    MAX_STEPS_REACHED = auto()
-    TIMEOUT = auto()
-
-@dataclass
-class SubAgentEvent:
-    agent_id: str
-    type: SubAgentEventType
-    message: str = ""
-    data: dict = None
-    timestamp: float = 0.0
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = time.time()
-
-# ============ Plan 状态机 ============
-class PlanState(Enum):
-    IDLE = "idle"               # 无 plan 或已消费
-    PENDING = "pending"         # plan prompt 已嵌入首步，等待 API 响应
-    PARSED = "parsed"           # plan 文本已提取，等待 _finalize_plan 消费
-    NEEDS_REPLAY = "needs_replay"  # plan 已解析但无工具调用，需重放首个子任务
-
-class PlanContext:
-    __slots__ = ('state', 'prompt', 'reasoning')
-    def __init__(self):
-        self.state = PlanState.IDLE
-        self.prompt = ""
-        self.reasoning = ""
-
-# ============ 能量管理 ============
-class BayesianEnergyManager:
-    """双层能量预算：软约束（流动资金）+ 硬约束（总预算）+ 投资-收益模型"""
-    def __init__(self, total_energy: float = 154800.0, step_overhead: int = 1000,
-                 cost_step: float = 2.0,
-                 cost_tool: float = 0.2,
-                 explore_roi: float = 0.5):
-        # 双层约束
-        self.total_energy = total_energy   # 硬上限（不可突破）
-        self.total_spent = 0.0             # 已净消耗（不可逆，只增不减）
-        self.energy = total_energy          # 流动资金（可预扣、可返还、可获奖金）
-        self.step_overhead = step_overhead  # 每步固定 token 开销
-        self.cost_step = cost_step
-        self.cost_tool = cost_tool
-        # Token 使用统计
-        self._total_tokens = 0
-        self._total_input = 0
-        self._total_output = 0
-        # Spawn 保留栈：每次 spawn 扣 20% 作为父节点保底，子返回后释放
-        self._reserve_stack: list[float] = []
-        # 探索投资回报率
-        self.explore_roi = explore_roi
-        # Beta(α, β) 后验：任务完成概率
-        self.done_alpha = 1.0
-        self.done_beta = 1.0
-        # 子任务成功率
-        self.subtask_beta: Dict[str, tuple] = {}
-        # 派生成功率
-        self.spawn_alpha = 2.0
-        self.spawn_beta = 2.0
-        # 连续无进展计数
-        self._no_progress_count = 0
-        # 失败计数
-        self.failure_count = 0
-        # 命令耗时先验 (Gamma): pattern -> (alpha_sum_time, beta_count)
-        self.cmd_time_prior: Dict[str, tuple] = {}
-        self.energy_per_second = Config.CMD_REFUND_PER_SEC  # 每秒退款速率
-        # 命令模式连续失败计数
-        self._cmd_fail_streak: Dict[str, int] = {}
-
-    # ---- 统一计费接口 ----
-    def charge(self, amount: float, *, check: bool = True) -> bool:
-        """扣除流动资金。check=False 时无条件扣除（用于已发生的 API 成本）。
-        返回 False 表示资金不足（仅 check=True 时可能）。"""
-        if check and self.energy < amount:
-            return False
-        self.energy -= amount
-        return True
-
-    def spend(self, amount: float):
-        """确认不可逆净消耗，累加到 total_spent。"""
-        self.total_spent += amount
-
-    def credit(self, amount: float):
-        """返还/奖励流动资金。"""
-        self.energy += amount
-
-    def expand_budget(self, amount: float):
-        """膨胀预算上限（用于奖励），不超过安全上限。"""
-        self.total_energy += amount
-        max_total = Config.CONTEXT_BUDGET - Config.CONTEXT_RESERVE // 2
-        if self.total_energy > max_total:
-            self.total_energy = max_total
-
-    # Token 使用统计
-    @property
-    def total_tokens(self) -> int:
-        return self._total_tokens
-
-    @property
-    def total_input_tokens(self) -> int:
-        return self._total_input
-
-    @property
-    def total_output_tokens(self) -> int:
-        return self._total_output
-
-    def add_tokens(self, input_t: int, output_t: int):
-        self._total_tokens += input_t + output_t
-        self._total_input += input_t
-        self._total_output += output_t
-
-    def update_subtask(self, sub_id: str, success: bool):
-        a, b = self.subtask_beta.get(sub_id, (1.0, 1.0))
-        if success:
-            a += 1
-            self._no_progress_count = 0
-        else:
-            b += 1
-            self._no_progress_count += 1
-        self.subtask_beta[sub_id] = (a, b)
-
-    def update_done(self, is_done: bool):
-        if is_done:
-            self.done_alpha += 1
-            self._no_progress_count = 0
-        else:
-            self.done_beta += 0.2  # 软惩罚
-
-    def update_spawn(self, success: bool):
-        if success:
-            self.spawn_alpha += 1
-        else:
-            self.spawn_beta += 1
-
-    def p_done(self) -> float:
-        return self.done_alpha / (self.done_alpha + self.done_beta)
-
-    def p_subtask_success(self, sub_id: str) -> float:
-        a, b = self.subtask_beta.get(sub_id, (1.0, 1.0))
-        return a / (a + b)
-
-    def should_spawn(self, energy_ratio: float = 0.3) -> bool:
-        p = self.spawn_alpha / (self.spawn_alpha + self.spawn_beta)
-        return (p > energy_ratio * 0.5
-                and self.energy > self.total_energy * energy_ratio
-                and self.total_spent < self.total_energy * 0.8)
-
-    # ── 能量感知调度 ──
-
-    def get_role_probability(self) -> float:
-        """返回 explore 概率（高能量+低进展→多探索，反之→多利用）"""
-        energy_ratio = self.energy / self.total_energy if self.total_energy > 0 else 0.0
-        p_done = self.p_done()
-        fail_penalty = min(self._no_progress_count, 5) * 0.05
-        explore_prob = energy_ratio * 0.5
-        if p_done < 0.3:
-            explore_prob += 0.2
-        elif p_done > 0.7:
-            explore_prob -= 0.2
-        explore_prob -= fail_penalty
-        return max(0.1, min(0.7, explore_prob))
-
-    def should_stop(self) -> tuple:
-        # 硬约束：总预算耗尽
-        if self.total_spent >= self.total_energy:
-            return True, f"Total budget exhausted ({self.total_spent:.1f}/{self.total_energy:.1f})"
-        # 软约束：流动资金耗尽
-        if self.energy <= 0:
-            return True, "Working capital depleted"
-        # 任务完成概率高
-        if self.p_done() > 0.9:
-            return True, f"Task likely done (P={self.p_done():.2f})"
-        # 连续无进展
-        if self._no_progress_count >= 5:
-            return True, f"No progress for {self._no_progress_count} rounds"
-        # 失败过多
-        if self.failure_count >= 5:
-            return True, f"Too many failures ({self.failure_count})"
-        return False, ""
-
-    def should_stop_with_estimator(self, estimator: StepEstimator) -> tuple:
-        basic, reason = self.should_stop()
-        if basic:
-            return basic, reason
-        # 能量前瞻：用期望值比较，给 80% 缓冲
-        # 仅在已有执行数据时才前瞻（至少跑过一轮）
-        if estimator and estimator.completed > 0:
-            rem_mean, _, _ = estimator.predict_remaining()
-            required = rem_mean * self.step_overhead * 0.8
-            if self.energy < required:
-                return True, f"Insufficient energy for remaining steps ({self.energy:.0f} < {required:.0f})"
-        return False, ""
-
-    # ---- 命令超时预估 ----
-    def _extract_pattern(self, command: str) -> str:
-        """提取命令模式：程序名 + 子命令（不含 URL/路径/文件名）"""
-        parts = command.strip().split()
-        if not parts:
-            return "empty"
-        prog = os.path.basename(parts[0]).lower()
-        for ext in ('.exe', '.cmd', '.bat', '.ps1'):
-            if prog.endswith(ext):
-                prog = prog[:-len(ext)]
-        if len(parts) < 2:
-            return prog
-        second = parts[1]
-        # URL / 路径 / 文件 / flag → 只保留程序名
-        if (second.startswith(('http://', 'https://', '-', '/', '\\', '.'))
-                or '\\' in second or '/' in second
-                or second.endswith(('.py', '.sh', '.js', '.json', '.txt'))):
-            return prog
-        # 子命令（如 npx playwright, pip install）
-        return f"{prog} {second}"
-
-    def estimate_cmd_time(self, command: str) -> tuple:
-        """返回 (期望秒, 上限秒95%)，Gamma 后验 + Wilson-Hilferty 近似"""
-        pattern = self._extract_pattern(command)
-        alpha_sum, beta_n = self.cmd_time_prior.get(pattern, (5.0, 1.0))
-        mean = alpha_sum / beta_n
-        shape = alpha_sum
-        if shape > 1:
-            # Wilson-Hilferty 近似 Gamma 95% 分位数
-            z = 1.645
-            factor = 1 - 1/(9*shape) + z * math.sqrt(1/(9*shape))
-            upper = (shape / beta_n) * max(0.5, factor) ** 3
-        else:
-            upper = mean * 3  # 数据不足，宽裕估计
-        return mean, min(upper, 60.0)
-
-    def pre_consume_for_cmd(self, command: str):
-        """预扣能量（基于预估上限 + 连续失败惩罚），返回预扣量或 False"""
-        _, upper = self.estimate_cmd_time(command)
-        pre_cost = upper * self.energy_per_second
-        pattern = self._extract_pattern(command)
-        streak = self._cmd_fail_streak.get(pattern, 0)
-        penalty = min(streak, 5) * 500
-        total_pre = pre_cost + penalty
-        return total_pre if self.charge(total_pre) else False
-
-    def refund_for_cmd(self, command: str, pre_cost: float,
-                       actual_seconds: float, success: bool) -> float:
-        """根据实际耗时和成败返还能量。失败只返还 50% 差额。"""
-        actual_cost = actual_seconds * self.energy_per_second
-        refund_ratio = 1.0 if success else 0.5
-        refund = max(0, pre_cost - actual_cost) * refund_ratio
-        net = pre_cost - refund
-        self.credit(refund)
-        self.spend(net)
-        # 更新后验
-        pattern = self._extract_pattern(command)
-        alpha_sum, beta_n = self.cmd_time_prior.get(pattern, (5.0, 1.0))
-        self.cmd_time_prior[pattern] = (alpha_sum + actual_seconds, beta_n + 1)
-        if success:
-            self._cmd_fail_streak[pattern] = 0
-        else:
-            self._cmd_fail_streak[pattern] = self._cmd_fail_streak.get(pattern, 0) + 1
-        return refund
-
-    # ---- 投资-收益模型（spawn_agent 专用） ----
-    def grant_terminal_reward(self, task_success: bool,
-                              plan_complexity: int = 1,
-                              actual_steps: int = 1,
-                              expected_steps: float = 1.0,
-                              tool_calls_count: int = 0):
-        """动态终端奖励：base × 难度 × 效率 × 工具调用阶梯系数。"""
-        if not task_success:
-            return 0.0
-        base = Config.REWARD_BASE
-        difficulty = min(2.0, 1.0 + 0.3 * (plan_complexity - 1))
-        spent_ratio = self.total_spent / self.total_energy if self.total_energy > 0 else 0
-        efficiency = max(0.3, 1.0 - spent_ratio)
-        tier = Config.REWARD_STEP_TIER
-        step_mult = 1.0 if tool_calls_count <= tier else max(0.8, 1.0 - 0.02 * (tool_calls_count - tier))
-        reward = base * difficulty * efficiency * step_mult
-        self.credit(reward)
-        self.expand_budget(reward)
-        tier_label = f"tools={tool_calls_count}≤{tier}:全额" if step_mult == 1.0 else f"tools={tool_calls_count}>{tier}:×{step_mult:.2f}"
-        print(f"  [Reward] +{reward:.0f}E (base={base:.0f} × diff={difficulty:.2f} × eff={efficiency:.2f} [{tier_label}])")
-        return reward
-
-    def process_event(self, event: 'SubAgentEvent'):
-        """处理子 Agent 事件，更新贝叶斯后验"""
-        if event.type == SubAgentEventType.STEP_COMPLETED:
-            pass  # 开销已在 execute_next_step 中通过 consume_step_overhead 扣除
-        elif event.type == SubAgentEventType.TOOL_FAILED:
-            self.failure_count += 1
-            self._no_progress_count += 1
-        elif event.type == SubAgentEventType.TASK_COMPLETED:
-            self.update_done(True)
-        elif event.type == SubAgentEventType.FATAL_ERROR:
-            self.failure_count += 1
-            self._no_progress_count += 1
-            self.update_done(False)
-        elif event.type == SubAgentEventType.MAX_STEPS_REACHED:
-            self.update_done(False)
-        elif event.type == SubAgentEventType.TIMEOUT:
-            self.failure_count += 1
-            self.update_done(False)
 
 # ============ Agent ============
 class Agent:
@@ -1720,19 +44,46 @@ class Agent:
                  skills: Optional[List[str]] = None,
                  auto_skill: bool = False,
                  depth: int = 0,
-                 parent: 'Agent' = None):
+                 parent: 'Agent' = None,
+                 energy_mgr: 'BayesianEnergyManager' = None,
+                 l2_cache: 'L2Cache' = None,
+                 model_spec: dict = None,
+                 can_spawn: bool = True,
+                 context_budget: int = None):
         self.work_dir = work_dir or Config.WORK_DIR
         os.makedirs(self.work_dir, exist_ok=True)
         self.depth = depth
         self.agent_id = f"agent_{random.randint(1000,9999)}"
         self.parent = parent
+        self.l2_cache = l2_cache
+        self.can_spawn = can_spawn
+        self.child_model_spec = None
+        self.intervention_budget = int(os.getenv("INTERVENTION_BUDGET", "3"))  # 人类干预预算
+        self.can_prune = True  # 允许剪枝（机械+未来 LLM 剪枝的权限开关）
 
-        # Anthropic SDK 客户端
-        self.client = anthropic.Anthropic(
-            api_key=Config.ANTHROPIC_API_KEY,
-            base_url=Config.ANTHROPIC_BASE_URL,
-            http_client=_http_client,
-        )
+        # ── 模型路由 ──
+        router = get_router()
+        cb = context_budget or Config.CONTEXT_BUDGET
+        self._model_id = "default"
+        if model_spec and (model_spec.get("id") or model_spec.get("tier") or model_spec.get("tags")):
+            sticky = f"{getattr(parent, 'agent_id', '')}:{self.agent_id}"
+            res = router.resolve_for_agent(model_spec, sticky_key=sticky,
+                                           required_context=min(cb, 8000))
+            self.client = res["client"]
+            cb = res["context_budget"]
+            self.can_spawn = res["can_spawn"] and can_spawn
+            self._model_id = res["model_id"]
+            self._model_spec = res.get("model_spec")
+            self._extra_params = res.get("extra_params", {})
+        else:
+            self.client = anthropic.Anthropic(
+                api_key=Config.ANTHROPIC_API_KEY,
+                base_url=Config.ANTHROPIC_BASE_URL,
+                http_client=_http_client,
+            )
+            self._extra_params = {}
+        self._router = router
+        self._context_budget = cb
 
         # Skill 管理（先于工具加载，放在稳定前缀中）
         self.skill_manager = SkillManager()
@@ -1768,8 +119,16 @@ class Agent:
         if self.start_time is None:
             from datetime import datetime
             self.start_time = datetime.now().strftime("%Y-%m-%d %p").replace("AM", "上午").replace("PM", "下午")
-        # 能量管理：共享父级（子孙同池），顶层新建
-        self.energy_manager = parent.energy_manager if parent else BayesianEnergyManager()
+        # 能量管理：优先用传入的独立实例（并行 spawn），其次共享父级，顶层新建
+        # 使用模型 context 窗口动态计算总能量，保留值按窗口比例（默认 25%）
+        reserve = min(Config.CONTEXT_RESERVE, int(self._context_budget * Config.CONTEXT_RESERVE_RATIO))
+        total_e = max(self._context_budget - reserve, 4000)
+        if energy_mgr is not None:
+            self.energy_manager = energy_mgr
+        elif parent:
+            self.energy_manager = parent.energy_manager
+        else:
+            self.energy_manager = BayesianEnergyManager(total_energy=total_e)
         # ── Pointer 磁盘缓存系统 ──
         # Scope 链：每个 agent 继承父 scope + 自己的 id
         self.scope = f"{parent.scope}.{self.agent_id}" if parent and hasattr(parent, 'scope') else "root"
@@ -1782,9 +141,15 @@ class Agent:
         # per-agent 工具轮数上限，跟能量预算挂钩
         self.max_tool_rounds = max(5, int(self.energy_manager.energy / 3000))
         # API 客户端
-        self._api = APIClient(self.client, Config, self._cache_provider, self.energy_manager)
+        self._api = APIClient(self.client, Config, self._cache_provider, self.energy_manager,
+                              model_id=self._model_id,
+                              model_spec=getattr(self, '_model_spec', None))
+        self._api._interventions_left = self.intervention_budget
         # 事件系统
         self.event_log: list[SubAgentEvent] = []
+        # 节点报告
+        self.reports_history: list[NodeReport] = []
+        self._current_report: Optional[NodeReport] = None
         # 流程图记录器：子 Agent 复用父级实例，避免覆盖
         if parent and hasattr(parent, 'flowchart') and parent.flowchart:
             self.flowchart = parent.flowchart
@@ -1959,6 +324,18 @@ class Agent:
         except Exception:
             pass
 
+    def _report(self, severity: str, category: str, message: str, data: dict = None):
+        """结构化事件上报（能量告警/空响应/spawn失败/异常吞没等）。"""
+        ts = time.strftime("%H:%M:%S")
+        data_str = f" {json.dumps(data, ensure_ascii=False)}" if data else ""
+        print(f"  [{severity.upper()}] [{category}] {ts} {message}{data_str}")
+        self.event_log.append(SubAgentEvent(
+            agent_id=self.agent_id,
+            type=SubAgentEventType.FATAL_ERROR if severity == "error" else SubAgentEventType.STEP_COMPLETED,
+            message=f"[{category}] {message}",
+            data=data or {},
+        ))
+
     def emit_event(self, event_type: SubAgentEventType, message: str = "", data: dict = None):
         event = SubAgentEvent(self.agent_id, event_type, message, data)
         self.event_log.append(event)
@@ -2035,27 +412,40 @@ class Agent:
         return "\n".join(b.text for b in response.content if hasattr(b, 'text'))
 
     # ---- 自适应上下文管理 ----
+    def _count_tokens(self, messages: list, system_blocks: list = None) -> int:
+        """精确 token 计数。SDK 支持 -> count_tokens()，否则 -> char/4 估算。"""
+        try:
+            if hasattr(self.client, 'messages') and hasattr(self.client.messages, 'count_tokens'):
+                params = {"messages": messages, "model": getattr(self, '_model_name', Config.MODEL)}
+                if system_blocks:
+                    params["system"] = system_blocks
+                result = self.client.messages.count_tokens(**params)
+                return getattr(result, 'input_tokens', 0)
+        except Exception:
+            pass
+        # Fallback: 估算
+        print(f"  [Token] count_tokens() unavailable, using char/4 estimate")
+        total = 0
+        for m in messages:
+            c = m.get("content", "")
+            if isinstance(c, str):
+                total += len(c)
+            elif isinstance(c, list):
+                total += len(json.dumps(c, ensure_ascii=False))
+        if system_blocks:
+            for s in system_blocks:
+                total += len(s.get("text", ""))
+        return total // 4
+
     def _estimate_context_length(self) -> int:
-        frames = list(self.stack)
-        budget = Config.CONTEXT_BUDGET
-        length = 0
-
-        for f in frames:
-            if f.level == 1:
-                length += len(f"## Plan\n{f.content}\n\n")
-        for f in frames:
-            if f.level == 3:
-                length += len(f"## Summary\n{f.content}\n\n")
-
-        summary_frames = [f for f in frames if f.level == 2]
-        remaining = budget - length
-        for f in reversed(summary_frames):
-            entry = f"Step {f.step_id}: {f.content}\n"
-            if remaining - len(entry) < 0:
-                break
-            length += len(entry)
-            remaining -= len(entry)
-        return length
+        """估算当前 context 的 token 数。优先用 API 精确计数，回退到本地估算。"""
+        try:
+            msgs, sys = self._build_messages()
+            return self._count_tokens(msgs, sys)
+        except Exception:
+            print(f"  [Token] _build_messages failed for estimate, using raw stack char/4")
+        # 无法构建消息时的粗略估算
+        return sum(len(f.content) for f in self.stack) // 4
 
     def _compress(self, text: str, step_id: int) -> str:
         # ── STORE：归档完整内容到磁盘 ──
@@ -2298,19 +688,33 @@ class Agent:
         exp += "\n建议：使用不同的方法或命令重试。\n"
         return exp
 
-    def _absorb_child_result(self, child_result: str, subtask_desc: str):
-        """根据父 Agent 能量决定保留完整内容还是仅摘要，将结果入栈。"""
-        energy_ratio = self.energy_manager.energy / self.energy_manager.total_energy if self.energy_manager.total_energy > 0 else 0
-        is_full = energy_ratio > 0.3 and len(child_result) < 2000
-        if is_full:
-            # 能量充足且内容不大，保留完整内容
-            self.stack.append(StackFrame("step_detail", child_result, self.step_counter, level=2, agent_id=self.agent_id))
-            print(f"  [Absorb] Full result ({len(child_result)} chars, energy {energy_ratio:.0%})")
+    def _absorb_child_result(self, child_result: str, subtask_desc: str,
+                              child_agent=None):
+        """吸收子 Agent 结果。
+
+        预算 = 父 freeze / 3 + 子剩余 energy * 0.3（对齐窗口模型）
+        """
+        em = self.energy_manager
+        # 子剩余 energy（从子获取，或估算）
+        child_remaining = getattr(child_agent, 'energy_manager', None)
+        if child_remaining and hasattr(child_remaining, 'energy'):
+            child_remaining = child_remaining.energy
         else:
-            # 能量紧张或内容过大，仅保留摘要
-            summary = self._make_summary(child_result)
+            child_remaining = em.energy * 0.5  # 估算
+        # 父 freeze：从子携带的 spawn 参数获取
+        freeze = getattr(child_agent, '_spawn_freeze', 0) if child_agent else 0
+        if freeze <= 0:
+            freeze = em.energy * Config.SPAWN_RESERVE_RATIO  # 估算
+        budget_tokens = int(freeze / 3 + child_remaining * 0.30)
+        budget_chars = max(200, budget_tokens // 4)
+        is_full = len(child_result) <= budget_chars
+        if is_full:
+            self.stack.append(StackFrame("step_detail", child_result, self.step_counter, level=2, agent_id=self.agent_id))
+            print(f"  [Absorb] Full ({len(child_result)}c <= budget {budget_chars}c, freeze={freeze:.0f}E child_rem={child_remaining:.0f}E)")
+        else:
+            summary = self._make_summary(child_result, max_len=min(budget_chars, 500))
             self.stack.append(StackFrame("summary", summary, self.step_counter, level=2, agent_id=self.agent_id))
-            print(f"  [Absorb] Summary only ({len(summary)}/{len(child_result)} chars, energy {energy_ratio:.0%})")
+            print(f"  [Absorb] Compressed ({len(summary)}/{len(child_result)}c, budget {budget_chars}c)")
         # 生命周期计数器：记录吸收类型（不再创建单独节点）
         if self.flowchart:
             try:
@@ -2395,7 +799,7 @@ class Agent:
                     break
             if not reclaimed_any:
                 break
-        # Phase 1: 循环压缩 step_detail → STORE + _compress → summary
+        # Phase 1: 循环压缩 step_detail -> STORE + _compress -> summary
         while True:
             est = self._estimate_context_length()
             if est < threshold:
@@ -2561,7 +965,7 @@ class Agent:
     def _build_messages(self) -> tuple[list, list]:
         """从栈帧生成多轮消息列表 + system blocks，供缓存友好的 API 调用。
         返回 (messages, system_blocks)，system_blocks 含 cache_control 断点。"""
-        cc = self._cache_provider.cache_control()
+        cc = getattr(self._api._adapter, 'cache_control', lambda: {})()
         PLATFORM_TEXT = (
             f"Program start time: {self.start_time}\n"
             "Platform: Windows. Use `python` not `python3`. "
@@ -2621,15 +1025,21 @@ class Agent:
         for i, f in enumerate(summaries):
             desc = done_subs[i]['desc'] if i < len(done_subs) else f"Step {f.step_id}"
             messages.append({"role": "user", "content": f"执行: {desc}"})
-            if f.type == "pointer":
-                # Pointer stub：显示摘要 + token 大小提示
-                ptr_id = getattr(f, 'pointer_id', '')
-                label = f"[Archived] {f.content}"
-                if ptr_id:
-                    entry = self.pointer_store._index.get(ptr_id)
-                    tok_info = f" ({entry.tokens} tokens)" if entry else ""
-                    label += f"{tok_info} (use recall tool to retrieve)"
-                messages.append({"role": "assistant", "content": label})
+            if getattr(f, 'failed', False):
+                # 失败步骤：只留一行摘要，不保留完整 tool 调用链
+                fail_preview = f.content[:100].replace("\n", " ")
+                messages.append({"role": "assistant", "content": f"[Step {f.step_id} FAILED] {fail_preview}"})
+            elif f.type == "pointer":
+                if getattr(f, 'expanded', False):
+                    messages.append({"role": "assistant", "content": f.content})
+                else:
+                    ptr_id = getattr(f, 'pointer_id', '')
+                    label = f"[Archived] {f.content}"
+                    if ptr_id:
+                        entry = self.pointer_store._index.get(ptr_id)
+                        tok_info = f" ({entry.tokens} tokens)" if entry else ""
+                        label += f"{tok_info} (use recall tool to retrieve)"
+                    messages.append({"role": "assistant", "content": label})
             else:
                 label = f"[Step {f.step_id}] " if f.type == "summary" else ""
                 messages.append({"role": "assistant", "content": label + f.content})
@@ -2657,10 +1067,25 @@ class Agent:
         # 多轮消息格式（缓存友好）
         base_messages, system_blocks = self._build_messages()
         cached_tools = _build_cached_tools(self._cache_provider)
-        cc = self._cache_provider.cache_control()
+        # Root 有完整描述，子节点继承理解 -> 去所有 desc
+        if self.depth > 0:
+            def _strip_desc(t):
+                t = {k: v for k, v in t.items() if k != "description"}
+                if "input_schema" in t and "properties" in t["input_schema"]:
+                    t["input_schema"] = dict(t["input_schema"])
+                    t["input_schema"]["properties"] = {
+                        pn: {pk: pv for pk, pv in pi.items() if pk != "description"}
+                        for pn, pi in t["input_schema"]["properties"].items()}
+                return t
+            cached_tools = [_strip_desc(t) for t in cached_tools]
+        # can_spawn=False -> 移除 spawn_agent（叶子节点）
+        if not self.can_spawn:
+            cached_tools = [t for t in cached_tools
+                           if t.get("name") != "spawn_agent"]
+        cc = getattr(self._api._adapter, 'cache_control', lambda: {})()
 
         # 当前步骤指令（缓存断点 #3: 最新 user 消息）
-        # Plan pending → 嵌入 plan prompt，一次 API 返回 A (plan) + B (tool calls)
+        # Plan pending -> 嵌入 plan prompt，一次 API 返回 A (plan) + B (tool calls)
         plan_prefix = self._plan.prompt
         if plan_prefix:
             step_text = f"{plan_prefix}\n\n[Progress] Step {self.step_counter}"
@@ -2720,13 +1145,16 @@ class Agent:
 
             try:
                 response = self._api.call(
-                    messages, system=system_blocks, tools=cached_tools
+                    messages, system=system_blocks, tools=cached_tools,
+                    extra_params=getattr(self, '_extra_params', None),
                 )
             except ContextTooLongError:
                 self._adapt_context()
                 self._maintain_pointer_table()
                 messages.append({"role": "assistant", "content": "[Context too long, compressed. Retry.]"})
                 continue
+            finally:
+                self._api.release()
 
             # ── A/B 分离：首次响应含 plan (A) + 执行 (B) ──────────────────
             plan_just_parsed = False
@@ -2741,16 +1169,29 @@ class Agent:
 
             if response.stop_reason == "tool_use":
                 tool_blocks = [b for b in response.content if b.type == "tool_use"]
+                # 厂商适配：提取 reasoning_content（DeepSeek/Kimi 思考链跨轮保留）
+                extra_msg = self._api._adapter.post_process(response)
                 # A/B 分离：plan 文本进 stack[1]（通过 PlanContext.reasoning），消息里只留简短标记
                 if plan_just_parsed:
                     clean_content = [{"type": "text", "text": "[Plan recorded. Executing...]"}]
+                    # 保留 thinking 块（DeepSeek/Kimi 跨轮必须）
                     for b in response.content:
-                        if b.type == "tool_use":
+                        if b.type == "thinking":
+                            clean_content.append({"type": "thinking",
+                                                  "thinking": b.thinking,
+                                                  "signature": b.signature})
+                        elif b.type == "tool_use":
                             clean_content.append({"type": "tool_use",
                                                   "id": b.id, "input": b.input, "name": b.name})
-                    messages.append({"role": "assistant", "content": clean_content})
+                    am = {"role": "assistant", "content": clean_content}
+                    if extra_msg.get("reasoning_content"):
+                        am["reasoning_content"] = extra_msg["reasoning_content"]
+                    messages.append(am)
                 else:
-                    messages.append({"role": "assistant", "content": response.content})
+                    am = {"role": "assistant", "content": response.content}
+                    if extra_msg.get("reasoning_content"):
+                        am["reasoning_content"] = extra_msg["reasoning_content"]
+                    messages.append(am)
 
                 # 并行工具补贴：无论多少个工具，只计 1 次，费用 ×3
                 # 合并 plan+execute 时免除工具费（省下的 plan 调用抵消）
@@ -2764,7 +1205,7 @@ class Agent:
                         break
                     self.energy_manager.spend(Config.TOOL_ENERGY_COST)
                 elif tool_count > 1:
-                    batch_cost = Config.TOOL_ENERGY_COST * 3
+                    batch_cost = Config.TOOL_ENERGY_COST * Config.BATCH_TOOL_COST_MULT
                     if not self.energy_manager.charge(batch_cost):
                         print(f"  [Tool] Energy depleted, cannot start tool batch ({tool_count} tools, cost={batch_cost})")
                         break
@@ -2773,44 +1214,168 @@ class Agent:
                     saved_str = f"(省 {saved} 次)" if saved > 0 else (f"(亏 {-saved} 次)" if saved < 0 else "(持平)")
                     print(f"  [Tool] 并行 {tool_count} 个工具，按 1 次计费 ×3 = {batch_cost} {saved_str}")
 
+                # ── 并行 spawn 检测 ──────────────────────────────────────
+                spawn_blocks = [b for b in tool_blocks if b.name == "spawn_agent"]
+                other_blocks = [b for b in tool_blocks if b.name != "spawn_agent"]
+                parallel_spawn_results = {}  # {block_id: result_dict}
+
+                agent_ctx = {
+                    "depth": self.depth,
+                    "system_prompt": self.stack[0].content,
+                    "parent_agent": self
+                }
+                if len(spawn_blocks) > 1:
+                    em = self.energy_manager
+                    spawn_n = len(spawn_blocks)
+                    if em.should_spawn():
+                        invest_per = max(float(Config.SPAWN_INVEST_MIN), em.energy * 0.05)
+                        reserve = em.energy * Config.SPAWN_RESERVE_RATIO
+                        total_deduct = invest_per * spawn_n + reserve
+                        if em.charge(total_deduct):
+                            em._reserve_stack.append(reserve)
+                            child_pool_energy = em.energy  # 扣留后的父流动资金 = 子 CoW 基准
+                            child_total = child_pool_energy * (1 - Config.SPAWN_RESERVE_RATIO)
+                            print(f"  [ParallelSpawn] {spawn_n} children, reserve={reserve:.0f}E, "
+                                  f"invest each={invest_per:.0f}E, child pool={child_total:.0f}E")
+
+                            # L2 同级共享缓存：每层分叉一个独立命名空间
+                            ns_id = f"l2_{self.agent_id}_{int(time.time()) % 100000}"
+                            l2_cache = L2Cache(ns_id, self.scope)
+                            print(f"  [L2] Created {ns_id} for {spawn_n} siblings")
+
+                            def _run_one_child(block, agent_ctx):
+                                args = dict(block.input)
+                                args["_parallel_mode"] = True
+                                args["_child_total_energy"] = child_total
+                                args["_l2_cache"] = l2_cache
+                                return block.id, ToolExecutor._spawn_agent(
+                                    args, Config.TOOL_RESULT_BUDGET, agent_ctx)
+
+                            with ThreadPoolExecutor(max_workers=spawn_n) as pool:
+                                futures = {pool.submit(_run_one_child, b, agent_ctx): b for b in spawn_blocks}
+                                for future in as_completed(futures):
+                                    block_id, result = future.result()
+                                    parallel_spawn_results[block_id] = result
+
+                            # 释放保底
+                            if em._reserve_stack:
+                                r = em._reserve_stack.pop()
+                                em.credit(r)
+                                print(f"  [ParallelSpawn] Reserve released: {r:.0f}E -> energy {em.energy:.0f}")
+                            # 结算投资（explore/exploit）
+                            for bid, r in parallel_spawn_results.items():
+                                mode = r.get("_mode", "exploit")
+                                success = r.get("success", False)
+                                if mode == "explore":
+                                    if success:
+                                        em.credit(invest_per + invest_per * em.explore_roi)
+                                    else:
+                                        em.spend(invest_per)
+                                else:
+                                    if success:
+                                        em.credit(invest_per)
+                                    else:
+                                        em.credit(invest_per * 0.5)
+                                        em.spend(invest_per * 0.5)
+                                if not success:
+                                    em.update_spawn(False)
+                            # 吸收结果
+                            for bid, r in parallel_spawn_results.items():
+                                if r.get("success") and self:
+                                    output = r.get("output", "")
+                                    task_desc = "parallel subtask"
+                                    for sb in spawn_blocks:
+                                        if sb.id == bid:
+                                            task_desc = sb.input.get("task", task_desc)[:80]
+                                            break
+                                    self._absorb_child_result(output, task_desc)
+                                    self.energy_manager.update_spawn(True)
+                                    # 经验上提
+                                    child_exp = r.get("_child_experiences", [])
+                                    if child_exp:
+                                        self._pending_experiences.extend(child_exp)
+                                        self._save_pending_experiences()
+                                        print(f"  [Experience] propagated {len(child_exp)} records from parallel child")
+                                    child_rep = r.get("_child_reports", [])
+                                    if child_rep:
+                                        for rd in child_rep:
+                                            try:
+                                                self.reports_history.append(NodeReport.from_dict(rd))
+                                            except Exception:
+                                                pass
+                            # 同期组完成，销毁 L2
+                            try:
+                                l2_cache.destroy()
+                                print(f"  [L2] Destroyed {ns_id}")
+                            except Exception:
+                                pass
+                        else:
+                            for b in spawn_blocks:
+                                parallel_spawn_results[b.id] = {"success": False, "output": "Insufficient energy for parallel spawn"}
+                    else:
+                        for b in spawn_blocks:
+                            parallel_spawn_results[b.id] = {"success": False, "output": "Spawn conditions not met (low energy/budget)"}
+
+                # ── 执行所有工具 ──────────────────────────────────────
+                # ── 只读工具并行（read_file, list_dir, recall, read_peer）──
+                READ_ONLY_TOOLS = {"read_file", "list_dir", "recall", "read_peer"}
+                read_blocks = [b for b in tool_blocks if b.name in READ_ONLY_TOOLS]
+                write_blocks = [b for b in tool_blocks if b.name not in READ_ONLY_TOOLS
+                                and b.id not in parallel_spawn_results]
+                spawn_pre = [b for b in tool_blocks if b.id in parallel_spawn_results]
+
+                def _exec_tool(block, budget):
+                    return ToolExecutor.execute(
+                        block.name, dict(block.input),
+                        budget=budget, agent_context=agent_ctx)
+
+                # 并行执行只读工具
+                tool_result_map = {}  # block_id -> result
+                if len(read_blocks) > 1:
+                    msg_total = sum(len(str(m)) for m in messages)
+                    rbudget = max(1000, min(Config.TOOL_RESULT_BUDGET,
+                                            Config.CONTEXT_BUDGET - msg_total))
+                    with ThreadPoolExecutor(max_workers=len(read_blocks)) as rpool:
+                        rfutures = {rpool.submit(_exec_tool, b, rbudget): b for b in read_blocks}
+                        for f in as_completed(rfutures):
+                            b = rfutures[f]
+                            tool_result_map[b.id] = f.result()
+                    print(f"  [Tool] {len(read_blocks)} read tools executed in parallel")
+                elif len(read_blocks) == 1:
+                    b = read_blocks[0]
+                    tool_result_map[b.id] = _exec_tool(b, Config.TOOL_RESULT_BUDGET)
+                # 串行执行写工具
+                for b in write_blocks:
+                    tool_result_map[b.id] = _exec_tool(b, Config.TOOL_RESULT_BUDGET)
+                # 并行 spawn 预执行结果
+                for bid, result in parallel_spawn_results.items():
+                    tool_result_map[bid] = result
+
+                # 按原始顺序组装 tool_results
                 tool_results = []
                 for block in tool_blocks:
+                    result = tool_result_map.get(block.id, {
+                        "success": False,
+                        "output": f"Tool execution missing: {block.name}"
+                    })
                     args_str = json.dumps(block.input, ensure_ascii=False)[:100]
-                    print(f"  [Tool] {block.name}({args_str})")
-
-                    msg_total = sum(len(str(m)) for m in messages)
-                    tool_budget = min(Config.TOOL_RESULT_BUDGET, Config.CONTEXT_BUDGET - msg_total)
-                    tool_budget = max(tool_budget, 1000)
-                    # 记录工具节点（同一 step 内同名工具合并计数）
-                    tool_cost = int(Config.TOOL_ENERGY_COST if tool_count <= 1 else batch_cost / max(tool_count, 1))
-                    merged_node = self.flowchart.merged_tool(
-                        step_node, block.name, self.step_counter, depth=self.depth) if self.flowchart else None
-
-
-                    agent_ctx = {
-                        "depth": self.depth,
-                        "system_prompt": self.stack[0].content,
-                        "parent_agent": self
-                    }
-                    result = ToolExecutor.execute(
-                        block.name, dict(block.input),
-                        budget=tool_budget, agent_context=agent_ctx
-                    )
-
                     status = "ok" if result["success"] else "error"
-                    # 更新流程图工具节点状态（成功/失败着色）
+                    print(f"  [Tool result] {block.name}({args_str}) status={status}: "
+                          f"{str(result.get('output', ''))[:80]}...")
+
+                    merged_node = self.flowchart.merged_tool(
+                        step_node, block.name, self.step_counter,
+                        depth=self.depth) if self.flowchart else None
                     if merged_node and self.flowchart and not result["success"]:
                         try:
                             self.flowchart._append(f"    class {merged_node} toolFail")
                         except Exception:
                             pass
-                    trunc = f" (truncated from {result.get('original_size', '?')})" if result.get("truncated") else ""
-                    print(f"  [Tool result] {status}: {result['output'][:80]}...{trunc}")
 
                     tr = {
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": result["output"],
+                        "content": result.get("output", ""),
                         "is_error": not result["success"]
                     }
                     if result.get("subtask_complete"):
@@ -2838,7 +1403,8 @@ class Agent:
                 em = self.energy_manager
                 budget_pct = em.total_spent / em.total_energy * 100 if em.total_energy > 0 else 0
                 tok_info = f" | Tokens {em.total_tokens}" if em.total_tokens > 0 else ""
-                print(f"  [{round_num+1}/{self.max_tool_rounds} rounds | Budget {budget_pct:.0f}% | Energy {em.energy:.0f}{tok_info}]")
+                ctx_info = f" | ctx~{em.estimated_context_usage:.0%}" if em._cumulative_input > 0 else ""
+                print(f"  [{round_num+1}/{self.max_tool_rounds} rounds | Budget {budget_pct:.0f}% | Energy {em.energy:.0f}{tok_info}{ctx_info}]")
 
                 # 存档点 pop：状态已恢复，中断工具循环
                 if getattr(self, '_just_popped', False):
@@ -2849,7 +1415,7 @@ class Agent:
 
             # stop_reason == "end_turn"
             final_text = self._extract_text(response)
-            # plan 刚解析但无工具调用 → 标记需要重放，让 run() 重新执行第一个子任务
+            # plan 刚解析但无工具调用 -> 标记需要重放，让 run() 重新执行第一个子任务
             if plan_just_parsed:
                 self._plan.state = PlanState.NEEDS_REPLAY
                 print(f"  [Plan] Plan-only response (no tool calls), will replay first subtask")
@@ -2870,6 +1436,34 @@ class Agent:
                         {"steps": 1, "tool_rounds": round_num + 1})
         self._adapt_context()
         self._maintain_pointer_table()
+
+        # ── L2 发布：步骤指针写入同级共享缓存 ──
+        if self.l2_cache:
+            try:
+                # 从栈中找本次步骤产生的 pointer_id
+                ptr_id = ""
+                token_est = 0
+                for f in self.stack:
+                    if hasattr(f, 'pointer_id') and f.pointer_id and f.step_id == self.step_counter:
+                        ptr_id = f.pointer_id
+                        token_est = len(f.content) // 4
+                        break
+                summary = final_text[:300].replace("\n", " ")
+                self.l2_cache.publish(self.agent_id, self.step_counter,
+                                       summary, ptr_id, token_est)
+            except Exception:
+                pass
+
+        # ── 节点报告：机械字段自动收集 ──
+        try:
+            report = NodeReport.collect_from_agent(self, task_desc=task[:200])
+            report.summary = final_text[:300].replace("\n", " ")
+            self._current_report = report
+            self.reports_history.append(report)
+            report.save()  # 持久化到磁盘
+        except Exception:
+            pass
+
         self._save_state()
 
         last_line_upper = final_text.rstrip().split("\n")[-1].upper()
@@ -2907,6 +1501,184 @@ class Agent:
         self.stack = deque(f for f in self.stack if f.level != level or f.type in ("constraint", "plan"))
         self._save_state()
         print(f"  [Merge] {len(frames)} level={level} frames -> level={new_level}")
+
+    # ---- 自动剪枝 ----
+    def _auto_prune(self):
+        """机械剪枝 — 同时上报关键事件。"""
+        if not self.can_prune:
+            return
+        em = self.energy_manager
+        # 1. 能量紧急
+        if em.energy / max(em.total_energy, 1) < 0.1 and em._no_progress_count >= 3:
+            self._report("warn", "energy", f"Emergency: {em.energy:.0f}E remaining, {em._no_progress_count} no-progress rounds")
+            print(f"  [Prune] Emergency: energy={em.energy:.0f}, no_progress={em._no_progress_count}")
+            # 截断 subtask_queue，只保留已完成和当前
+            done_subs = [s for s in self.subtask_queue if s.get('done')]
+            if done_subs:
+                pending = [s for s in self.subtask_queue if not s.get('done')]
+                if pending:
+                    # 保留第一个未完成的，其余丢弃
+                    self.subtask_queue = done_subs + [pending[0]]
+                    print(f"  [Prune] Trimmed {len(pending)-1} pending subtasks")
+
+        # 2. 连续失败：同一子任务失败 3 次 -> 标记取消
+        failures = [r for r in self.reports_history[-10:]
+                    if r.system_verify.get("severity") in ("fail", "warn")]
+        if len(failures) >= 3:
+            # 检查是否同一 subtree
+            failed_tasks = set(f.task_summary[:60] for f in failures)
+            if len(failed_tasks) == 1:
+                print(f"  [Prune] Stuck on '{list(failed_tasks)[0]}' — {len(failures)} failures")
+                # 如果还有并行兄弟没完成，等它们；否则标记跳过
+                pending = [s for s in self.subtask_queue if not s.get('done')]
+                if len(pending) == 1 and pending[0]['desc'][:60] == list(failed_tasks)[0]:
+                    pending[0]['done'] = True  # 标记跳过
+                    pending[0]['_pruned'] = True
+                    print(f"  [Prune] Skipped stuck subtask")
+
+        # 3. 低质量报告 -> 过滤（不影响执行，只影响汇总）
+        bad_reports = [r for r in self.reports_history
+                       if r.energy_used > 0 and r.tokens_output == 0]
+        if len(bad_reports) > 5:
+            # 截断到最近 20 条好报告
+            good = [r for r in self.reports_history if r.tokens_output > 0]
+            if len(good) > 10:
+                self.reports_history = good[-20:]
+                print(f"  [Prune] Filtered bad reports, kept {len(good)} good")
+
+    # ---- 聚合 (Aggregator 节点) ----
+    def aggregate_children(self, children_data: list[dict],
+                           action: str = "none",
+                           output_to: str = "parent",
+                           task_hint: str = "") -> dict:
+        """统一聚合节点：收集子节点报告 -> 评判 -> 可选整理/合并 -> 路由输出。
+
+        Args:
+            children_data: [{report: NodeReport_dict, output_text: str}, ...]
+            action: "none" | "collate" | "merge"
+            output_to: "parent" | "peer" | "child"
+
+        Returns:
+            {judgment: dict, merged_result: str (if action!=none), output_to: str}
+        """
+        if not children_data:
+            return {"judgment": {}, "merged_result": "", "output_to": output_to}
+
+        # ── 1. 机械评判报告：纯事实陈述，不调 LLM ──
+        comparison_rows = []
+        for i, cd in enumerate(children_data):
+            r = cd.get("report", {})
+            row = {
+                "index": i + 1,
+                "agent_id": r.get("agent_id", f"child_{i}"),
+                "step_count": r.get("step_count", 0),
+                "tokens": r.get("tokens_input", 0) + r.get("tokens_output", 0),
+                "energy_used": r.get("energy_used", 0),
+                "tool_call_count": len(r.get("tool_calls", [])),
+                "files": r.get("files_produced", []),
+                "system_verify": r.get("system_verify", {}).get("severity", "?"),
+                "exit_code": r.get("exit_code", 0),
+            }
+            comparison_rows.append(row)
+
+        # 分组统计
+        total_tokens = sum(r["tokens"] for r in comparison_rows)
+        total_energy = sum(r["energy_used"] for r in comparison_rows)
+        all_verified = all(r["system_verify"] == "pass" for r in comparison_rows)
+
+        judgment = {
+            "children_count": len(children_data),
+            "comparison": comparison_rows,
+            "summary": {
+                "total_tokens": total_tokens,
+                "total_energy": total_energy,
+                "all_system_verify_pass": all_verified,
+            },
+        }
+
+        # 保存评判报告到磁盘
+        try:
+            jr = NodeReport(
+                agent_id=self.agent_id,
+                node_name=task_hint[:60],
+                node_type="aggregator",
+                step_count=len(children_data),
+                children=comparison_rows,
+                tool_calls=[],
+                created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+            jr.save()
+            self.reports_history.append(jr)
+        except Exception:
+            pass
+
+        # ── 2. 整理/合并（仅 action != none 时调 LLM） ──
+        merged_result = ""
+        if action in ("collate", "merge") and len(children_data) > 0:
+            # 收集子节点输出
+            parts = []
+            for i, cd in enumerate(children_data):
+                output = cd.get("output_text", "")
+                if output:
+                    parts.append(f"--- 节点 {i+1} ---\n{output[:2000]}")
+
+            if parts:
+                if action == "collate":
+                    system = "你是整合助手。将以下互补成果拼接为一份连贯的产出。不丢失关键信息。"
+                else:  # merge
+                    system = "你是去重助手。将以下平行成果合并为一份，去除重复内容，统一表述。"
+
+                prompt = (f"任务: {task_hint}\n\n" +
+                          f"以下评判数据供参考:\n"
+                          f"  子节点数={len(children_data)}, "
+                          f"总token={total_tokens}, 系统验证={'全部通过' if all_verified else '部分预警'}\n\n" +
+                          "\n".join(parts) +
+                          f"\n\n请生成{'整合' if action=='collate' else '合并'}后的产出（不超过800字）。")
+
+                try:
+                    resp = self._api.call(
+                        [{"role": "user", "content": prompt}],
+                        system=system,
+                        max_tokens=1200,
+                    )
+                    merged_result = self._extract_text(resp)
+                    print(f"  [Aggregator] {action} -> {len(merged_result)} chars")
+                except Exception as e:
+                    print(f"  [Aggregator] {action} failed: {e}")
+                    merged_result = f"(aggregation error: {e})"
+
+        # ── 3. 路由输出 ──
+        if output_to == "parent":
+            # 结果入栈，向上级汇报
+            output = merged_result or f"Aggregation judgment: {len(children_data)} children, {total_tokens} tokens"
+            self.stack.append(StackFrame("step_detail", output, self.step_counter, level=2,
+                                          agent_id=self.agent_id))
+        elif output_to == "peer":
+            # 发布到 L2，同级可读
+            if self.l2_cache and merged_result:
+                # STORE 到 pointer，发布 stub
+                pid = self.pointer_store.store(
+                    merged_result, task=task_hint[:60], level=0,
+                    frame_type="aggregated", step_id=self.step_counter,
+                    parent_scope=self.scope, extra_tags=["aggregated"],
+                )
+                summary = merged_result[:300].replace("\n", " ")
+                self.l2_cache.publish(self.agent_id, self.step_counter,
+                                       summary, pid or "", len(merged_result) // 4)
+        elif output_to == "child":
+            # 作为新的子任务下发——暂存到 subtask_queue
+            if merged_result:
+                self.subtask_queue.append({
+                    "desc": f"Aggregated: {task_hint[:80]}",
+                    "done": False,
+                    "_aggregated_content": merged_result,
+                })
+
+        return {
+            "judgment": judgment,
+            "merged_result": merged_result,
+            "output_to": output_to,
+        }
 
     # ---- 显示 ----
     def print_stack(self):
@@ -3176,13 +1948,18 @@ class Agent:
         for plugin in _PLUGINS:
             plugin.on_run_start(self, task)
 
-        # 初始化能量管理器（顶层 Agent）
+        # 初始化能量管理器（顶层 Agent），使用模型 context 窗口，保留值按比例
         if not self.parent:
+            cb = self._context_budget or Config.CONTEXT_BUDGET
+            reserve = min(Config.CONTEXT_RESERVE, int(cb * 0.25))
+            total_e = max(cb - reserve, 4000)
             self.energy_manager = BayesianEnergyManager(
-                total_energy=Config.CONTEXT_BUDGET - Config.CONTEXT_RESERVE,  # 154800E
+                total_energy=total_e,
                 step_overhead=Config.STEP_OVERHEAD,
                 cost_tool=Config.TOOL_ENERGY_COST,
             )
+            # 自动剪枝（基于机械事实 + 贝叶斯数据）
+            self._auto_prune()
             # 重置当前任务 tool 调用记录
             self._current_tool_calls = []
             # 注入相关历史经验
@@ -3190,6 +1967,11 @@ class Agent:
             # 注入内置流程技能模板（作为建议参考）
             for plugin in _PLUGINS:
                 plugin.inject_procedure_template(self, task)
+            # TLB 预热：经验注入的指针
+            warm_ids = [f.pointer_id for f in self.stack
+                        if hasattr(f, 'pointer_id') and f.pointer_id]
+            if warm_ids:
+                self.pointer_store.warm_tlb(warm_ids)
 
         # 自动匹配 Skill（仅顶层 agent 匹配，子 agent 通过父级 context 继承）
         if self.auto_skill and not self.active_skills and not self.parent:
@@ -3331,7 +2113,7 @@ class Agent:
                     # subtask 引用重新绑定（队列已被 _finalize_plan 替换）
                     subtask = self.subtask_queue[sub_idx] if sub_idx < len(self.subtask_queue) else self.subtask_queue[-1]
 
-                # Plan-only 重放：首次响应只有 plan 文本无工具调用 → 重试当前子任务
+                # Plan-only 重放：首次响应只有 plan 文本无工具调用 -> 重试当前子任务
                 if self._plan.state == PlanState.NEEDS_REPLAY:
                     self._plan.state = PlanState.IDLE
                     # 重新构建 step_task（subtask_queue 可能已更新，subtask 引用已变）
@@ -3370,15 +2152,17 @@ class Agent:
                         subtask['done'] = True
                         self.energy_manager.update_subtask(f"sub_{sub_idx}", True)
                         consecutive_failures = 0
-                        print(f"  [Dual-Auth] Agent ✓  System ✓  — subtask complete")
+                        print(f"  [Dual-Auth] Agent OK  System OK  — subtask complete")
 
                     elif agent_done and sys_v["severity"] in ("warn", "fail"):
-                        # Agent claims done, System disagrees — allow Agent's judgment
-                        # but inject warning feedback so Agent can self-correct next round
-                        subtask['done'] = True  # Agent's decision stands
+                        subtask['done'] = True
                         self.energy_manager.update_subtask(f"sub_{sub_idx}", True)
-                        consecutive_failures = 0  # agent's decision stands
-                        print(f"  [Dual-Auth] Agent ✓  System ✗  — Agent over-claim? ({sys_v['reason']})")
+                        consecutive_failures = 0
+                        # 标记失败步骤 -> 跨节点时压缩（只留摘要，不保留完整 tool 调用）
+                        for f in self.stack:
+                            if f.type in ("step_detail", "summary") and f.step_id == self.step_counter:
+                                f.failed = True
+                        print(f"  [Dual-Auth] Agent OK  System WARN — Agent over-claim? ({sys_v['reason']})")
                         self._verify_feedback.append(
                             f"[系统复盘提醒] {sys_v['feedback']} "
                             f"（Agent 标记完成，但系统检测到异常。请确认是否确实完成。）"
@@ -3391,13 +2175,13 @@ class Agent:
                             subtask['done'] = True
                             self.energy_manager.update_subtask(f"sub_{sub_idx}", True)
                             consecutive_failures = 0
-                            print(f"  [Dual-Auth] Agent ✗  System ✓  — conversational task, auto-done ({sys_v['reason']})")
+                            print(f"  [Dual-Auth] Agent FAIL  System OK  — conversational task, auto-done ({sys_v['reason']})")
                         else:
                             # Agent 过于保守 — nudge
                             subtask['done'] = False  # respect Agent's caution
                             self.energy_manager.update_subtask(f"sub_{sub_idx}", False)
                             consecutive_failures += 1
-                            print(f"  [Dual-Auth] Agent ✗  System ✓  — Agent too conservative? ({sys_v['reason']})")
+                            print(f"  [Dual-Auth] Agent FAIL  System OK  — Agent too conservative? ({sys_v['reason']})")
                             self._verify_feedback.append(
                                 f"[系统复盘提醒] 系统检测到子任务可能已完成（{sys_v['reason']}）。"
                                 f"如果你认为确实完成，可以直接声明完成。"
@@ -3426,7 +2210,10 @@ class Agent:
                 self.energy_manager.update_done(done)
                 # 更新贝叶斯预估器
                 self.step_estimator.update(steps_consumed)
-                print(f"\nResult:\n{result}")
+                try:
+                    print(f"\nResult:\n{result[:500]}")
+                except UnicodeEncodeError:
+                    print(f"\nResult:\n{result[:500].encode('ascii',errors='replace').decode()}")
                 sub_idx += 1
             except RuntimeError as e:
                 print(f"Error: {e}")
@@ -3548,7 +2335,7 @@ class Agent:
                         eff = max(0.3, 1.0 - spent_ratio)
                         reward = base * diff * eff
                     rw_id = "reward"
-                    label = f"{'✓ 成功' if task_success else '✗ 失败'} +{reward:.0f}E奖励"
+                    label = f"{'OK 成功' if task_success else '✗ 失败'} +{reward:.0f}E奖励"
                     self.flowchart.add_node(rw_id, label, shape="decision")
                     # 连到最后一个 sub 节点或 task_start
                     last_done_sub = None
@@ -3563,6 +2350,10 @@ class Agent:
             # 最终状态
             print(f"  [Final] Energy: {em.energy:.0f} | Spent: {em.total_spent:.0f}/{em.total_energy:.0f}")
 
+        # 清理 ipython 会话
+        if hasattr(self, '_ipy_sessions') and self._ipy_sessions:
+            for sid in list(self._ipy_sessions):
+                del self._ipy_sessions[sid]
         print("\nDone!")
         # 关闭流程图
         if self.flowchart:
@@ -3586,7 +2377,7 @@ class Agent:
     def _format_progress(self, current_idx: int) -> str:
         lines = []
         for i, sub in enumerate(self.subtask_queue):
-            status = "✓" if sub['done'] else ("▶" if i == current_idx else "○")
+            status = "OK" if sub['done'] else ("▶" if i == current_idx else "○")
             lines.append(f"{status} {i+1}. {sub['desc']}")
         return "Progress:\n" + "\n".join(lines)
 
@@ -3594,16 +2385,16 @@ class Agent:
         """通用任务验证 — 基于工具调用链的验证分派。
 
         从 _current_tool_calls 提取工具类别，分派到对应验证器：
-        - 领域插件 → 通过 register_verifier 注册的验证器
-        - write_file → 文件验证（存在+非空）
-        - run_command → 命令验证（退出码）
-        - 默认 → 关键词验证
+        - 领域插件 -> 通过 register_verifier 注册的验证器
+        - write_file -> 文件验证（存在+非空）
+        - run_command -> 命令验证（退出码）
+        - 默认 -> 关键词验证
 
         Returns: {"verified": bool, "reason": str, "feedback": str, "severity": str}
         severity: "pass" | "warn" | "fail"
         """
         try:
-            from task_verifier import TaskVerifier
+            from agent_kernel_verify import TaskVerifier
             if not hasattr(self, '_task_verifier') or self._task_verifier is None:
                 self._task_verifier = TaskVerifier(self)
             result = self._task_verifier.verify(subtask_desc, result_text)
@@ -3622,119 +2413,23 @@ class Agent:
                     pass
             return result
         except ImportError:
-            # Fallback: 关键词验证
+            print("  [Verify] TaskVerifier unavailable — falling back to keyword check")
             return self._keyword_verify(result_text)
 
     @staticmethod
     def _keyword_verify(result_text: str) -> dict:
-        """关键词验证（fallback）。"""
+        """关键词验证（仅作微弱信号，不作权威判断）。"""
         result_lower = result_text.lower()
-        has_success = any(kw in result_lower for kw in [
-            '"success": true', '"success":true', 'success: true',
-            '✅', '成功', '已完成', 'confirmed', '任务完成', 'placed at',
-        ])
+        # 只认强信号：DONE/TASK COMPLETE 是 Agent 自己写的，不是验证
         has_failure = any(kw in result_lower for kw in [
             '"success": false', '"success":false', 'success: false',
-            '失败', 'error:', 'failed',
+            '失败', 'error:', 'failed', 'traceback', 'exception',
         ])
-        if has_success:
-            return {"verified": True, "reason": "success signal detected", "feedback": "", "severity": "pass"}
         if has_failure:
             return {"verified": False, "reason": "failure signal detected",
-                    "feedback": "[系统复盘] 检测到失败信号。建议检查并重试。", "severity": "fail"}
-        return {"verified": True, "reason": "no verification needed", "feedback": "", "severity": "pass"}
+                    "feedback": "[系统复盘] 检测到失败信号。建议检查并重试。",
+                    "severity": "fail"}
+        return {"verified": False, "reason": "unverified (no tool-chain verifier available)",
+                "feedback": "[系统复盘] 无法通过工具链验证。请人工审查结果。",
+                "severity": "warn"}
 
-# ============ 连接测试（轻量） ============
-def check_connection(client: anthropic.Anthropic) -> bool:
-    """用最短请求验证 API 可达，529 过载自动重试"""
-    print("Testing API connection...")
-    for attempt in range(3):
-        try:
-            response = client.messages.create(
-                model=Config.MODEL,
-                max_tokens=5,
-                messages=[{"role": "user", "content": "OK"}]
-            )
-            if response.content:
-                print("✓ API connected")
-                return True
-        except anthropic.APIStatusError as e:
-            if e.status_code == 529:
-                wait = 2 ** attempt + random.uniform(0, 2)
-                print(f"  API overloaded, retry {attempt+1}/3 in {wait:.1f}s...")
-                time.sleep(wait)
-                continue
-            print(f"✗ Connection failed: {e}")
-        except Exception as e:
-            print(f"✗ Connection failed: {e}")
-            break
-    return False
-
-# ============ CLI ============
-def main(t):
-    parser = argparse.ArgumentParser(description="Autonomous Agent")
-    parser.add_argument("--resume", action="store_true", help="Resume from saved state")
-    parser.add_argument("--task", type=str, help="Task description")
-    parser.add_argument("--system", type=str, help="System prompt")
-    parser.add_argument("--steps", type=int, help="Max steps")
-    parser.add_argument("--skill", type=str, action='append', help="Specify Skill")
-    parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
-    parser.add_argument("--auto-skill", action="store_true", help="Auto-match Skills")
-    parser.add_argument("--list-skills", action="store_true", help="List available Skills")
-    parser.add_argument("--no-plan", action="store_true", help="Skip planning phase (save API call)")
-    args = parser.parse_args()
-
-    # 清除代理环境变量 — 防止内网 API 调用被路由到代理服务器
-    for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
-                "ALL_PROXY", "all_proxy", "no_proxy", "NO_PROXY"):
-        os.environ.pop(key, None)
-
-    if args.list_skills:
-        sm = SkillManager()
-        names = sm.list_names()
-        if names:
-            print("Available Skills:")
-            for name in names:
-                s = sm.get(name)
-                print(f"  {name}: {s.description}")
-        else:
-            print("No Skills found (create in ./skills/)")
-        return
-
-    # 启动时检测 state 文件膨胀（超过 1MB 自动清除重置）
-    for fname in ("state.json", "pending_exp.json"):
-        fpath = os.path.join(Config.WORK_DIR, fname)
-        try:
-            if os.path.exists(fpath) and os.path.getsize(fpath) > 1_048_576:
-                sz_mb = os.path.getsize(fpath) / 1_048_576
-                print(f"  [Sanity] {fname} is {sz_mb:.1f}MB (>1MB), resetting")
-                os.remove(fpath)
-        except Exception:
-            pass
-
-    if args.resume:
-        print("Resuming saved state...")
-        try:
-            agent = Agent.load_state()
-            print(f"✓ Resumed at Step {agent.step_counter}")
-        except FileNotFoundError:
-            print("No saved state, creating new Agent")
-            agent = Agent(args.system or "你是一个AI编程助手。",
-                                skills=args.skill, auto_skill=args.auto_skill)
-    else:
-        agent = Agent(args.system or "你是一个AI编程助手。",
-                            skills=args.skill, auto_skill=args.auto_skill)
-
-    # 连接测试复用 Agent 的 client（省一次预热调用）
-    if not check_connection(agent.client):
-        print("\nCheck API config in .env (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL)")
-        sys.exit(1)
-
-    task = args.task or t
-    if args.interactive:
-        agent.interact(initial_task=task if task else None, max_steps=args.steps)
-    else:
-        agent.run(task, args.steps, skip_plan=args.no_plan)
-
-if __name__ == "__main__":
-    main("hi")
