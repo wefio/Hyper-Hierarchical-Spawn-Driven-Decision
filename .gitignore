@@ -1,0 +1,10 @@
+.claude/settings.local.json
+/__pycache__
+/agent_state
+/debug_messages
+/experience_store
+/history
+DESIGN.md
+models.yaml
+summary_result.md
+分形智能体结构解析.md
