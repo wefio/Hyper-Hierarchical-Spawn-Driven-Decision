@@ -115,7 +115,7 @@ level 3: merge        — 阶段汇合
 - `energy`（软，流动资金）：可预扣、返还、奖励，允许透支至 -10%
 - `total_spent`（硬，不可逆累加）：触顶即停
 
-所有操作消耗以 token 计量（1:1）。input ×1.0，output ×3.0，cache_read ×0.1，cache_write ×1.25。
+所有操作消耗以 token 计量（1:1）。所有 token 等权 1:1。Energy 计的是 context 窗口占用，不做费率区分。
 
 贝叶斯后验：Beta(α,β) 估计任务完成/子任务成功/spawn 成功率；Gamma 估计命令耗时。`should_stop()` 检查：硬预算耗尽、流动资金耗尽、P(done)>0.9、5 轮无进展、5 次失败。`should_stop_with_estimator()` 额外前瞻剩余步数所需能量。
 
