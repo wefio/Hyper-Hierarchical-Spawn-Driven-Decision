@@ -6,10 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 pip install anthropic          # only dependency
-python agent.py --task "..."   # run with a task
-python agent.py -i --task "..."  # interactive mode
-python agent.py --resume       # resume from agent_state/state.json
-PLUGINS=example_plugin python agent.py --task "..."  # load plugins
+python main.py --task "..."   # run with a task
+python main.py -i --task "..."  # interactive mode
+python main.py --resume       # resume from agent_state/state.json
+PLUGINS=example_plugin python main.py --task "..."  # load plugins
 ```
 
 No test suite, linter, or type checker.
@@ -26,21 +26,38 @@ No test suite, linter, or type checker.
 | PointerStore | Disk swap | `archive/*.md`，栈内留 stub `摘要:ptr_id` |
 | recall 工具 | Page fault | 从磁盘取回内容，注入 reclaimable 帧 |
 | 子 Agent 前缀继承 | CoW / 共享页表 | 缓存命中，递归分解可行 |
+| L2Cache | CPU L2 缓存 | 同级 agent 共享指针列表，内存中，零信任签名 |
 | Savepoint | PDA 栈快照 | 回退状态，保留推导历史 |
 | Energy | 资源配额 + RL reward | 阻止无限递归，奖励成功 |
 
 ## 代码文件
 
-`agent.py`（~3700 行）包含所有核心类。`config.py` 是为了打破循环导入（`experience_store.py` 需要 Config，但不能 import 整个 agent.py）而拆出来的。
-
 ```
-agent.py            # Agent, BayesianEnergyManager, ToolExecutor, FlowchartRecorder,
-                    #   SavepointManager, SkillManager, APIClient, CacheProvider, event bus
-config.py           # Config 单例（env 加载在 import 时即执行）, smart_truncate()
-experience_store.py # SQLite + FTS5 经验留存 + 技能挖掘
-pointer_store.py    # 上下文磁盘归档（虚拟内存模型）
-task_verifier.py    # 按工具链分派的验证框架
-plugins/            # importlib 动态加载的插件模块
+agent.py                    # Agent 主类（进程本体）
+main.py                     # CLI 入口
+config.py                   # Config 单例 + _PLUGINS 加载 + smart_truncate()
+skill.py                    # Skill + SkillManager
+
+agent_memory_frame.py       # StackFrame, SavepointMeta (基础类型)
+agent_memory_l2.py          # L2Cache — 同级共享内存缓存 (CPU L2 类比)
+agent_memory_report.py      # NodeReport — 节点执行报告 (引擎自动收集机械字段)
+
+agent_process_executor.py   # ToolExecutor + TOOL_DEFINITIONS + energy_hooks
+
+agent_scheduler_energy.py   # BayesianEnergyManager + StepEstimator
+
+agent_kernel_glue.py        # APIClient + CacheProvider + FlowchartRecorder +
+                            #   EventBus + SavepointManager + PlanContext + SubAgentEvent
+agent_kernel_router.py      # ModelRouter — 异构模型路由 + 并发控制
+agent_kernel_verify.py      # TaskVerifier (原 task_verifier.py)
+
+agent_template.py           # 分形模板引擎 — YAML 模板 + 四级指针复用 + 三种分叉
+pointer_store.py            # 上下文磁盘归档 + 多级页表 + 全局指针库
+
+experience_store.py         # SQLite + FTS5 经验留存
+agent_template.py           # 分形模板引擎 — YAML 模板 + 四级指针复用 + 三种分叉
+pointer_store.py            # 上下文磁盘归档 + 多级页表 + 全局指针库
+plugins/                    # importlib 动态加载的插件模块
 ```
 
 ## Core loop
@@ -78,16 +95,17 @@ level 3: merge        — 阶段汇合
 `_reclaim_energy()`（line 2097）当能量不足以支付下次 API 调用时，五阶段弹栈回收：
 0. 驱逐不活跃存档点历史 1. reclaimable 帧 2. 空壳（≤50 字符）3. summary/merge（按 LRU-K）4. step_detail
 
-## PointerStore — 上下文磁盘缓存（`pointer_store.py`）
+## PointerStore — 上下文磁盘缓存 + 多级页表（`pointer_store.py`）
 
-三层：`PointerEntry`（元数据）→ `PointerIndex`（内存索引/页表）→ `PointerStore`（门面）
+三层：`PointerEntry`（元数据，含复用追踪字段）→ `PointerIndex`（内存索引/页表）→ `PointerStore`（门面）+ `GlobalPointerStore`（全局指针库）
 
-- `store()`：内容写入 `archive/日期/任务/ptr_xxx.md`，建索引，返回 ptr_id
-- `recall()`：scope 检查（父可见子）+ offset/max_tokens 分页，更新 use_count
-- `merge_pointers()`：同 task 多个 level-0 pointer 合并为 level-1 索引表（段选择子）
-- `search_keywords()`：scope 过滤的摘要搜索
-- 索引原子写入：tmp → rename → .bak
-- Scope 链式：`"root"` → `"root.agent_1234"` → `...`，父可访问所有后代，分支间隔离
+`PointerEntry` 新增字段：`input_hash`, `template_id`, `freshness_days`, `verification`, `hits`, `reuses`, `last_hit_at`, `last_reused_at`, `hit_rate`（property）。
+
+- `store()` / `recall()` / `merge_pointers()` / `search_keywords()` — 原有磁盘缓存
+- `register_page_table()` / `add_to_page_table()` / `lookup()` — 多级页表（L0=原文, L1=input_hash组, L2=模板索引, L3=全局）
+- `find_reusable()` — 四级查找：L1 精确复用 → L2 同模板参考 → L3 全局经验 → L4 FTS5
+- `validate_entry()` / `record_hit()` / `evict_cold()` — 有效性 + 命中率驱动淘汰
+- `GlobalPointerStore` — 跨模板全局搜索 + NodeReport 自动注册
 
 ## Energy — 上下文约束（`BayesianEnergyManager`, line 1447）
 
@@ -97,7 +115,7 @@ level 3: merge        — 阶段汇合
 - `energy`（软，流动资金）：可预扣、返还、奖励，允许透支至 -10%
 - `total_spent`（硬，不可逆累加）：触顶即停
 
-所有操作消耗以 token 计量（1:1）。input ×1.0，output ×3.0，cache_read ×0.1，cache_write ×1.25。
+所有操作消耗以 token 计量（1:1）。所有 token 等权 1:1。Energy 计的是 context 窗口占用，不做费率区分。
 
 贝叶斯后验：Beta(α,β) 估计任务完成/子任务成功/spawn 成功率；Gamma 估计命令耗时。`should_stop()` 检查：硬预算耗尽、流动资金耗尽、P(done)>0.9、5 轮无进展、5 次失败。`should_stop_with_estimator()` 额外前瞻剩余步数所需能量。
 

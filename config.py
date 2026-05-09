@@ -24,10 +24,13 @@ class Config:
     CONTEXT_BUDGET = int(os.getenv("CONTEXT_BUDGET", "204800"))       # 模型上下文窗口上限
     CONTEXT_RESERVE = int(os.getenv("CONTEXT_RESERVE", "50000"))      # 保留给 system/tools/紧急交付
     STEP_OVERHEAD = int(os.getenv("STEP_OVERHEAD", "1000"))           # 每步固定能量开销
-    TOKEN_COST_INPUT = float(os.getenv("TOKEN_COST_INPUT", "1.0"))    # 输入能量系数
-    TOKEN_COST_OUTPUT = float(os.getenv("TOKEN_COST_OUTPUT", "3.0"))  # 输出能量系数
+    TOKEN_COST_INPUT = float(os.getenv("TOKEN_COST_INPUT", "1.0"))    # token→能量 1:1
     SPAWN_INVEST_MIN = int(os.getenv("SPAWN_INVEST_MIN", "2000"))     # spawn 最低投资
+    SPAWN_INVEST_RATIO = float(os.getenv("SPAWN_INVEST_RATIO", "0.01"))  # spawn 投资比例
     SPAWN_RESERVE_RATIO = float(os.getenv("SPAWN_RESERVE_RATIO", "0.15"))  # spawn 预留比例
+    SAVEPOINT_BACKUP_COST = float(os.getenv("SAVEPOINT_BACKUP_COST", "0.1"))  # savepoint 备份成本系数
+    BATCH_TOOL_COST_MULT = float(os.getenv("BATCH_TOOL_COST_MULT", "3"))  # 并行工具批量倍率
+    CONTEXT_RESERVE_RATIO = float(os.getenv("CONTEXT_RESERVE_RATIO", "0.25"))  # context 保留比例
     REWARD_BASE = float(os.getenv("REWARD_BASE", "5000"))             # 终端奖励基数
     CMD_REFUND_PER_SEC = float(os.getenv("CMD_REFUND_PER_SEC", "500"))  # 命令超时退款速率
     TOOL_ENERGY_COST = float(os.getenv("TOOL_ENERGY_COST", "200"))      # 单次工具调用预扣能量
@@ -88,6 +91,27 @@ Config.load_env()
 # .env 加载后再读 API key（.env 可能覆盖环境变量）
 Config.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", Config.ANTHROPIC_API_KEY)
 Config.ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", Config.ANTHROPIC_BASE_URL)
+
+
+# ============ 插件加载 ============
+import importlib as _importlib
+_PLUGINS: list = []
+
+def _load_plugins():
+    """从 Config.PLUGINS 动态加载插件模块。"""
+    global _PLUGINS
+    for name in Config.PLUGINS:
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            mod = _importlib.import_module(name)
+            _PLUGINS.append(mod)
+            print(f"  [Plugin] loaded: {name}")
+        except ImportError as e:
+            print(f"  [Plugin] skipped: {name} ({e})")
+
+_load_plugins()
 
 
 # ============ 上下文长度管理 ============
