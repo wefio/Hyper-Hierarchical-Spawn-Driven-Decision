@@ -9,3 +9,13 @@ models.yaml
 summary_result.md
 分形智能体结构解析.md
 models.yaml
+.playwright-mcp/
+.files/
+chainlit-page.yml
+weather*.json
+project_summary.md
+summary_result.md
+flowchart.md
+cache_experiment/
+test_metrics/
+models.yaml
