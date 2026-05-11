@@ -1,0 +1,4 @@
+/* Collapsible code blocks — 3 lines, expand on click */
+.cb-collapsed { max-height: 16em !important; overflow: hidden !important; position: relative; }
+.cb-collapsed::after { content: "\25BC Expand"; position: absolute; bottom: 0; left: 0; right: 0; padding: 0.5em; text-align: center; cursor: pointer; font-size: 0.8rem; color: #888; background: linear-gradient(transparent, var(--card, #fff) 70%); }
+.cb-expanded { max-height: none !important; }
