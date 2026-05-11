@@ -14,7 +14,8 @@ async def start():
         for mid in r.registry.tiers.get(t, []):
             s = r.registry.get(mid)
             if s: models.append((mid, t, f"{s.context_window//1000}k"))
-    ws = tempfile.mkdtemp(prefix="hhsdd_")
+    ws = os.path.join(tempfile.gettempdir(), "hhsdd_workspace")
+    os.makedirs(ws, exist_ok=True)
     cl.user_session.set("workspace", ws)
     ml = "\n".join(f"- `{mid}` [{t.upper()}] ({ctx})" for mid, t, ctx in models)
     await cl.Message(content=f"Models:\n{ml}\n\n`/model <id>` to switch").send()
@@ -36,7 +37,21 @@ async def on_message(msg: cl.Message):
         return
 
     agent = Agent(
-        system_prompt="你是AI助手。用中文。完成输出[DONE]。",
+        system_prompt="\n".join([
+            "输出格式：",
+            "思考和正文用 Markdown 格式输出",
+            "思考过程：用 > 引用块，每个独立步骤前加 - ",
+            "工具返回结果：用 ``` 代码块包裹",
+            "任务结束：末尾单独一行 [DONE]",
+            "",
+            "工具并行：",
+            "互不依赖的工具可一起发起",
+            "",
+            "上下文：",
+            "用 recall 取回历史指针内容",
+            "用 read_peer 查看同级 Agent 进度",
+            "用 spawn_agent 拆分复杂任务",
+        ]),
         depth=0, model_spec={"id": mid}, work_dir=ws)
 
     # Capture timeline: thinking blocks + tool calls interleaved
