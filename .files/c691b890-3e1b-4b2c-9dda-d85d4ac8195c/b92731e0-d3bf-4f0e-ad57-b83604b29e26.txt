@@ -1,3 +1,0 @@
-The user just said "hi". Based on the past experience, there was a "hi -> 你好！有什么我可以帮你的吗？😊" pattern that was marked as FAIL, and the lesson says "在任务完成后，使用明确的结束标记（如'DONE'）". 
-
-So the user is testing me - they want me to respond to "hi" and then end with DONE. Let me respond naturally.

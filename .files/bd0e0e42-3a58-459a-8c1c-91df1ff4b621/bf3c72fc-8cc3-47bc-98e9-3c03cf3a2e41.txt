@@ -1,1 +1,0 @@
-The user said "hi" - this is a simple greeting. Based on the past experience, the response should be a friendly greeting in Chinese. The task is complete after responding.

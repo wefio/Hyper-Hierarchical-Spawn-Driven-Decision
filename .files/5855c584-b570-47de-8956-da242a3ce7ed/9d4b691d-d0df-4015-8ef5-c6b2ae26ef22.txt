@@ -1,7 +1,0 @@
-The user is asking 1+1=?. Based on the past experience (a failed attempt that said it's simple and equals 2), I should just answer directly.
-
-Actually, looking at the "Relevant Past Experience" - it says [FAIL] for 1+1=? and the lesson says "基础数学事实直接验证了简单加法，无需复杂计算。可复用教训：当任务看似简单时，可直接应用基本知识，避免过度复杂化。"
-
-Wait, it says [FAIL] which is unusual. But the lesson still says it's simple and equals 2. So the answer should be 2.
-
-Let me just answer directly.
