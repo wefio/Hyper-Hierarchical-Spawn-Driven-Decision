@@ -35,7 +35,24 @@ async def on_message(msg: cl.Message):
             await cl.Message(content=f"Unknown: `{req}`").send()
         return
 
-    agent = Agent(system_prompt="你是AI助手。用中文。完成输出[DONE]。",
-                  depth=0, model_spec={"id": mid}, work_dir=ws)
+    agent = Agent(
+        system_prompt="你是AI助手。用中文。完成输出[DONE]。",
+        depth=0, model_spec={"id": mid}, work_dir=ws)
+
+    # Capture thinking blocks from API response (DeepSeek/Kimi)
+    import time as _time
+    thinks = []
+    orig = agent._api.call
+    def wrap(*a, **kw):
+        t0 = _time.time(); r = orig(*a, **kw)
+        ms = int((_time.time()-t0)*1000)
+        if hasattr(r,'content'):
+            for b in r.content:
+                if getattr(b,'type','')=='thinking' and getattr(b,'thinking',''):
+                    thinks.append(f"**已思考（{ms/1000:.1f}s）**\n> " + b.thinking.replace('\n','\n> '))
+        return r
+    agent._api.call = wrap
+
     r = await cl.make_async(agent.run)(t, max_steps=20)
-    await cl.Message(content=r or "(no response)").send()
+    out = "\n\n".join(thinks + [r or "(no response)"]) if thinks else (r or "(no response)")
+    await cl.Message(content=out).send()
