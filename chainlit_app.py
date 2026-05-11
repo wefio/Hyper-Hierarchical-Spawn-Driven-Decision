@@ -39,9 +39,10 @@ async def on_message(msg: cl.Message):
         system_prompt="你是AI助手。用中文。完成输出[DONE]。",
         depth=0, model_spec={"id": mid}, work_dir=ws)
 
-    # Capture thinking blocks from API response (DeepSeek/Kimi)
+    # Capture timeline: thinking blocks + tool calls interleaved
     import time as _time
-    thinks = []
+    timeline = []
+    think_msgs = []
     orig = agent._api.call
     def wrap(*a, **kw):
         t0 = _time.time(); r = orig(*a, **kw)
@@ -49,10 +50,35 @@ async def on_message(msg: cl.Message):
         if hasattr(r,'content'):
             for b in r.content:
                 if getattr(b,'type','')=='thinking' and getattr(b,'thinking',''):
-                    thinks.append(f"**已思考（{ms/1000:.1f}s）**\n> " + b.thinking.replace('\n','\n> '))
+                    think_text = b.thinking
+                    timeline.append(('think', f"**已思考（{ms/1000:.1f}s）**\n> " + think_text.replace('\n','\n> ')))
+                    # Also send as separate message for collapsible effect
+                    think_msgs.append((ms, think_text))
         return r
     agent._api.call = wrap
 
-    r = await cl.make_async(agent.run)(t, max_steps=20)
-    out = "\n\n".join(thinks + [r or "(no response)"]) if thinks else (r or "(no response)")
-    await cl.Message(content=out).send()
+    # Intercept tool execution: inline timeline + sidebar details
+    from agent_process_executor import ToolExecutor as _TE
+    import json as _json
+    _orig_exec = _TE.execute
+    tool_elements = []
+    def _wrap_exec(name, args, budget, agent_context):
+        timeline.append(('tool', f"- `{name}`"))
+        result = _orig_exec(name, args, budget, agent_context)
+        inp = _json.dumps(args, ensure_ascii=False)[:500]
+        out = str(result.get('output', ''))
+        tool_elements.append(cl.Text(
+            name=f"{name} ({'OK' if result.get('success') else 'FAIL'})",
+            content=f"Input:\n```json\n{inp}\n```\nOutput:\n```\n{out}\n```",
+            display="side",
+        ))
+        return result
+    _TE.execute = staticmethod(_wrap_exec)
+
+    try:
+        r = await cl.make_async(agent.run)(t, max_steps=20)
+    finally:
+        _TE.execute = _orig_exec
+
+    parts = [e[1] for e in timeline] + [r or "(no response)"]
+    await cl.Message(content="\n\n".join(parts), elements=tool_elements if tool_elements else None).send()

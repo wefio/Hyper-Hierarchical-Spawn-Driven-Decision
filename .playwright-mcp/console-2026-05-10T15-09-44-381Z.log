@@ -1,0 +1,3 @@
+[     345ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8000/assets/index-DEOT4A90.css:0
+[     346ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8000/assets/index-CRSpZLJs.js:0
+[    1428ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:8000/favicon:0

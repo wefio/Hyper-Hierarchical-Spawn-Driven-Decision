@@ -40,6 +40,27 @@ class APIClient:
             self._adapter = ProviderAdapter()
         self._model_spec = model_spec
 
+    def _record_usage(self, result, bypass_energy: bool = False, total_ms: float = 0):
+        raw_meta = {}
+        raw_meta = self._adapter.parse_usage(result, raw_meta)
+        inp = raw_meta.get("input_tokens", 0)
+        out = raw_meta.get("output_tokens", 0)
+        self.last_call_meta = {
+            "model": getattr(result, 'model', self._model_name),
+            "total_ms": total_ms,
+            "input_tokens": inp, "output_tokens": out,
+            "cache_read_tokens": raw_meta.get("cache_read_tokens", 0),
+            "cache_write_tokens": raw_meta.get("cache_write_tokens", 0),
+        }
+        if not bypass_energy and hasattr(result, 'usage') and self.em:
+            cost = (inp + out) * Config.TOKEN_COST_INPUT
+            self.em.charge(cost, check=False)
+            self.em.spend(cost)
+            self.em.add_tokens(inp, out)
+            self.em.track_input(inp)
+            if raw_meta.get("cache_read_tokens", 0) > 0:
+                print(f"  [Cache] read {raw_meta['cache_read_tokens']} tokens")
+
     def release(self):
         if self._model_id and self._model_id.startswith("human"):
             return
@@ -168,10 +189,37 @@ class APIClient:
             print(f"[Human] {response[:100].encode('ascii', errors='replace').decode()}")
         return mock_msg
 
+    def call_stream(self, messages: list, system=None, tools=None,
+                    max_tokens: int = 4096, extra_params: dict = None):
+        """流式调用 API，yield text_delta 字符串。"""
+        if self._model_id and self._model_id.startswith("human"):
+            yield "[Human model does not support streaming]"
+            return
+
+        kwargs = {"model": self._model_name, "max_tokens": max_tokens,
+                  "messages": messages}
+        if system: kwargs["system"] = system
+        if tools: kwargs["tools"] = tools
+        if self._model_spec:
+            kwargs = self._adapter.build_request(kwargs, self._model_spec)
+        elif extra_params:
+            kwargs["extra_body"] = extra_params
+
+        try:
+            with self.client.messages.stream(**kwargs) as stream:
+                for text in stream.text_stream:
+                    yield text
+                final = stream.get_final_message()
+                if final:
+                    self._record_usage(final)
+        finally:
+            self.release()
+
     def call(self, messages: list, system=None, tools=None,
              max_tokens: int = 4096, bypass_energy: bool = False,
-             extra_params: dict = None):
-        """调用 API（或人类模型时阻塞 stdin），返回 Message 对象"""
+             extra_params: dict = None, stop_sequences: list = None,
+             text_callback=None):
+        """调用 API，返回 Message 对象。text_callback 可选，支持流式。"""
         # ── 人类模型：展示上下文，阻塞读 stdin ──
         if self._model_id and self._model_id.startswith("human"):
             return self._call_human(messages, system, tools)
@@ -182,6 +230,8 @@ class APIClient:
             kwargs["system"] = system
         if tools:
             kwargs["tools"] = tools
+        if stop_sequences:
+            kwargs["stop_sequences"] = stop_sequences
         # 厂商适配器：请求转换
         if self._model_spec:
             kwargs = self._adapter.build_request(kwargs, self._model_spec)
@@ -198,6 +248,18 @@ class APIClient:
         overload_retries = 0
         max_overload = max_retries * 3
 
+        # ── 流式模式：text_callback + stream.get_final_message() ──
+        if text_callback:
+            kwargs.pop("stop_sequences", None)  # streaming 不支持 stop_sequences
+            with self.client.messages.stream(**kwargs) as stream:
+                for text in stream.text_stream:
+                    text_callback(text)
+                result = stream.get_final_message()
+            if result and hasattr(result, 'usage') and self.em:
+                self._record_usage(result, bypass_energy)
+            self.release()
+            return result
+
         for attempt in range(max_retries + max_overload):
             try:
                 t0 = time.time()
@@ -206,31 +268,10 @@ class APIClient:
                 self._last_call_time = time.time()
                 self._dump("res", result)
 
-                # ── 厂商适配器：解析用量 ──
-                raw_meta = {}
-                raw_meta = self._adapter.parse_usage(result, raw_meta)
-                inp = raw_meta.get("input_tokens", 0)
-                out = raw_meta.get("output_tokens", 0)
-                cr = raw_meta.get("cache_read_tokens", 0)
-                cw = raw_meta.get("cache_write_tokens", 0)
-
-                self.last_call_meta = {
-                    "model": getattr(result, 'model', self.cfg.MODEL),
-                    "total_ms": total_ms,
-                    "input_tokens": inp,
-                    "output_tokens": out,
-                    "cache_read_tokens": cr,
-                    "cache_write_tokens": cw,
-                }
-
-                if not bypass_energy and hasattr(result, 'usage') and self.em:
-                    cost = (inp + out) * Config.TOKEN_COST_INPUT  # 所有 token 等权
-                    self.em.charge(cost, check=False)
-                    self.em.spend(cost)
-                    self.em.add_tokens(inp, out)
-                    self.em.track_input(inp)  # 累积追踪（调参用）
-                    if cr > 0:
-                        print(f"  [Cache] read {cr} tokens")
+                total_ms = (time.time() - t0) * 1000
+                self._last_call_time = time.time()
+                self._dump("res", result)
+                self._record_usage(result, bypass_energy, total_ms)
 
                 return result
 

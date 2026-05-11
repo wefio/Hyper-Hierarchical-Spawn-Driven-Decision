@@ -973,7 +973,9 @@ class Agent:
             "When running scripts, use `python scripts/NAME.py` (files auto-routed to scripts/). "
             "CRITICAL: Every `python -c` command MUST include print() to show output. "
             "Think first, then write ONE correct command instead of trial-and-error. "
-            "完成任务后在末尾单独一行写 DONE，否则写 CONTINUE。"
+            "Tools accept _result_tokens (100 token/档, 如 20=2000 tokens) to set output budget. "
+            "Budget fit = tool cost ×0.8 reward. "
+            "任务完成时在末尾输出 [DONE]（系统自动停止），否则写 CONTINUE。"
         )
         # Plugin prompt fragments
         for plugin in _PLUGINS:
@@ -1048,6 +1050,7 @@ class Agent:
 
     # ---- 单步执行（原生工具循环） ----
     def execute_next_step(self, task: str) -> tuple[str, bool]:
+        self._in_user_task = True  # 标记用户任务（前端用）
         self.step_counter += 1
         if not self.energy_manager.charge(self.energy_manager.step_overhead):
             print(f"  [Step {self.step_counter}] Energy depleted (overhead), skipping step")
@@ -1147,6 +1150,7 @@ class Agent:
                 response = self._api.call(
                     messages, system=system_blocks, tools=cached_tools,
                     extra_params=getattr(self, '_extra_params', None),
+                    stop_sequences=["[DONE]"],
                 )
             except ContextTooLongError:
                 self._adapt_context()
@@ -1249,7 +1253,7 @@ class Agent:
                                 args["_child_total_energy"] = child_total
                                 args["_l2_cache"] = l2_cache
                                 return block.id, ToolExecutor._spawn_agent(
-                                    args, Config.TOOL_RESULT_BUDGET, agent_ctx)
+                                    args, max(Config.TOOL_RESULT_MIN, Config.CONTEXT_BUDGET - msg_total), agent_ctx)
 
                             with ThreadPoolExecutor(max_workers=spawn_n) as pool:
                                 futures = {pool.submit(_run_one_child, b, agent_ctx): b for b in spawn_blocks}
@@ -1325,16 +1329,29 @@ class Agent:
                 spawn_pre = [b for b in tool_blocks if b.id in parallel_spawn_results]
 
                 def _exec_tool(block, budget):
+                    args = dict(block.input)
+                    # 模型自定预算：_result_tokens (100 token/档)，引擎用 min 限制
+                    model_tokens = int(args.pop("_result_tokens", 0) or 0)
+                    if model_tokens > 0:
+                        model_budget = model_tokens * 100 * 4  # tokens → chars
+                        budget = min(model_budget, budget)  # 不超 context
+                        # 预算控制得好 → 奖励
+                        if model_budget <= budget:
+                            actual_cost = int(Config.TOOL_ENERGY_COST * 0.8)
+                            print(f"  [Tool] Budget reward: cost {Config.TOOL_ENERGY_COST} -> {actual_cost}")
+                            # refund difference
+                            diff = Config.TOOL_ENERGY_COST - actual_cost
+                            if diff > 0 and agent_ctx.get("parent_agent"):
+                                agent_ctx["parent_agent"].energy_manager.credit(diff)
                     return ToolExecutor.execute(
-                        block.name, dict(block.input),
-                        budget=budget, agent_context=agent_ctx)
+                        block.name, args, budget=budget, agent_context=agent_ctx)
 
                 # 并行执行只读工具
+                msg_total = sum(len(str(m)) for m in messages)
+                remaining = Config.CONTEXT_BUDGET - msg_total
+                rbudget = max(Config.TOOL_RESULT_MIN, remaining)
                 tool_result_map = {}  # block_id -> result
                 if len(read_blocks) > 1:
-                    msg_total = sum(len(str(m)) for m in messages)
-                    rbudget = max(1000, min(Config.TOOL_RESULT_BUDGET,
-                                            Config.CONTEXT_BUDGET - msg_total))
                     with ThreadPoolExecutor(max_workers=len(read_blocks)) as rpool:
                         rfutures = {rpool.submit(_exec_tool, b, rbudget): b for b in read_blocks}
                         for f in as_completed(rfutures):
@@ -1343,10 +1360,10 @@ class Agent:
                     print(f"  [Tool] {len(read_blocks)} read tools executed in parallel")
                 elif len(read_blocks) == 1:
                     b = read_blocks[0]
-                    tool_result_map[b.id] = _exec_tool(b, Config.TOOL_RESULT_BUDGET)
+                    tool_result_map[b.id] = _exec_tool(b, rbudget)
                 # 串行执行写工具
                 for b in write_blocks:
-                    tool_result_map[b.id] = _exec_tool(b, Config.TOOL_RESULT_BUDGET)
+                    tool_result_map[b.id] = _exec_tool(b, rbudget)
                 # 并行 spawn 预执行结果
                 for bid, result in parallel_spawn_results.items():
                     tool_result_map[bid] = result
@@ -1467,11 +1484,9 @@ class Agent:
         self._save_state()
 
         last_line_upper = final_text.rstrip().split("\n")[-1].upper()
-        tail_text = final_text.rstrip().split("\n")[-5:]  # last 5 lines
-        # DONE 标记：标准 "DONE" 或中文完成标记（不同模型格式不同）
+        # 完成检测：stop_sequence [DONE] 或文本末尾 DONE 标记
         is_done = ("DONE" in last_line_upper
-                   or any("任务完成" in l for l in tail_text)
-                   or "TASK COMPLETE" in last_line_upper)
+                   or getattr(response, 'stop_reason', '') == "stop_sequence")
         # 记录步骤完成节点
         if self.flowchart:
             try:
@@ -1481,6 +1496,7 @@ class Agent:
             except Exception:
                 pass
 
+        self._in_user_task = False
         return final_text, is_done
 
     # ---- 汇合 ----

@@ -1,0 +1,8 @@
+Input:
+```json
+{"command": "curl -s \"wttr.in/Beijing?format=%C|%t|%h|%w|%P\" 2>&1", "timeout": 15}
+```
+Output:
+```
+Sunny|+31°C|26%|↖8km/h|1007hPa
+```

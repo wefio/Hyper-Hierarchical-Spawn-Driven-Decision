@@ -38,6 +38,7 @@ class Config:
     # ---- 上下文管理 ----
     COMPRESSION_THRESHOLD = float(os.getenv("COMPRESSION_THRESHOLD", "0.9"))  # 上下文占比触发压缩
     TOOL_RESULT_BUDGET = int(os.getenv("TOOL_RESULT_BUDGET", "4000"))         # 单次工具结果字符上限
+    TOOL_RESULT_MIN = int(os.getenv("TOOL_RESULT_MIN", "2000"))              # 工具结果字符下限（100 token/档）
     MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "120000"))         # 消息列表总字符上限
 
     # ---- 安全网（正常由能量系统停止） ----

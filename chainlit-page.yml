@@ -1,0 +1,50 @@
+- generic [ref=e5]:
+  - generic [ref=e6]:
+    - button [ref=e9] [cursor=pointer]:
+      - img
+    - generic [ref=e10]:
+      - button "说明" [ref=e11] [cursor=pointer]:
+        - generic [ref=e12]: 说明
+      - button "Toggle theme" [ref=e13] [cursor=pointer]:
+        - img
+        - generic [ref=e14]: Toggle theme
+  - generic [ref=e18]:
+    - generic [ref=e25]:
+      - img "Avatar for Assistant" [ref=e28]
+      - generic [ref=e32]:
+        - article [ref=e33]: Models
+        - list [ref=e34]:
+          - listitem [ref=e35]:
+            - code [ref=e36]: deepseek:v4-pro
+            - text: "[OPUS] (1000k)"
+          - listitem [ref=e37]:
+            - code [ref=e38]: deepseek:v4-flash
+            - text: "[SONNET] (200k)"
+          - listitem [ref=e39]:
+            - code [ref=e40]: kimi:kimi-for-coding
+            - text: "[SONNET] (204k)"
+          - listitem [ref=e41]:
+            - code [ref=e42]: local:qwen3.5-4b
+            - text: "[HAIKU] (32k)"
+          - listitem [ref=e43]:
+            - code [ref=e44]: local:gemma-4
+            - text: "[HAIKU] (131k)"
+          - listitem [ref=e45]:
+            - code [ref=e46]: local:qwen2.5-05b
+            - text: "[HAIKU] (262k)"
+          - listitem [ref=e47]:
+            - code [ref=e48]: human:default
+            - text: "[FALLBACK] (99999k)"
+        - article [ref=e49]:
+          - code [ref=e50]: /model <id>
+          - text: to switch
+    - generic [ref=e52]:
+      - generic [ref=e53]:
+        - textbox "在此输入您的消息..." [active] [ref=e55]
+        - generic [ref=e56]:
+          - button [ref=e59] [cursor=pointer]:
+            - img
+          - generic [ref=e60]:
+            - button [disabled]:
+              - img
+      - article [ref=e63]: 大语言模型可能会犯错。请核实重要信息。
