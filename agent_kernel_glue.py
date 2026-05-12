@@ -4,6 +4,7 @@ import json
 import os
 import time
 import random
+import hashlib
 from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -39,6 +40,25 @@ class APIClient:
             from agent_kernel_router import ProviderAdapter
             self._adapter = ProviderAdapter()
         self._model_spec = model_spec
+        # 缓存命中率追踪
+        self._prev_block_hashes = []  # 上次调用的块级哈希列表
+        self._cache_hit_log = []      # 历史命中率记录
+        # 累计 cache token 统计（来自 API 厂商数据）
+        self._total_cache_read = 0
+        self._total_cache_write = 0
+        self._total_input = 0
+
+    @property
+    def cache_stats(self) -> dict:
+        """返回累计缓存统计（供 agent 进度行显示）。"""
+        cum_total = self._total_cache_read + self._total_input
+        cum_pct = self._total_cache_read / cum_total * 100 if cum_total > 0 else 0
+        return {
+            "cache_read": self._total_cache_read,
+            "cache_write": self._total_cache_write,
+            "total_input": self._total_input,
+            "hit_pct": cum_pct,
+        }
 
     def _record_usage(self, result, bypass_energy: bool = False, total_ms: float = 0):
         raw_meta = {}
@@ -58,8 +78,74 @@ class APIClient:
             self.em.spend(cost)
             self.em.add_tokens(inp, out)
             self.em.track_input(inp)
-            if raw_meta.get("cache_read_tokens", 0) > 0:
-                print(f"  [Cache] read {raw_meta['cache_read_tokens']} tokens")
+
+        # 累计 cache token 统计
+        cache_read = raw_meta.get("cache_read_tokens", 0)
+        cache_write = raw_meta.get("cache_write_tokens", 0)
+        self._total_cache_read += cache_read
+        self._total_cache_write += cache_write
+        self._total_input += inp
+        # 总输入 = cache_read(缓存前缀) + inp(新 token)
+        total_input_this = cache_read + inp
+        if total_input_this > 0:
+            hit_pct = cache_read / total_input_this * 100
+            cum_total = self._total_cache_read + self._total_input
+            cum_pct = self._total_cache_read / cum_total * 100 if cum_total > 0 else 0
+            print(f"  [Cache] hit {cache_read}/{total_input_this} ({hit_pct:.0f}%) "
+                  f"| cumulative {self._total_cache_read}/{cum_total} ({cum_pct:.0f}%)")
+
+    def _compute_prefix_overlap(self, messages: list, system) -> tuple:
+        """对比当前 messages 与上一次调用的块级前缀重叠。
+        返回 (overlap_blocks, total_blocks, overlap_chars, total_chars)。
+        Anthropic 缓存基于前缀匹配：连续调用中相同的前缀部分命中缓存。"""
+        def _block_text(block):
+            if isinstance(block, dict):
+                return block.get("text", json.dumps(block, ensure_ascii=False))
+            return str(block)
+
+        def _msg_text(msg):
+            c = msg.get("content", "")
+            if isinstance(c, list):
+                parts = []
+                for item in c:
+                    if isinstance(item, dict):
+                        parts.append(item.get("text", item.get("input", {}).
+                                   get("text", "")) if item.get("type") == "text"
+                                   else json.dumps(item, ensure_ascii=False))
+                    else:
+                        parts.append(str(item))
+                return "\n".join(parts)
+            return str(c)
+
+        # 构建当前调用的块级哈希列表
+        current = []
+        current_chars = []
+        # system blocks
+        if system:
+            for s in (system if isinstance(system, list) else [system]):
+                text = _block_text(s)
+                current.append(hashlib.sha256(text.encode()).hexdigest()[:16])
+                current_chars.append(len(text))
+        # message blocks
+        for m in messages:
+            text = _msg_text(m)
+            prefix = f"{m.get('role', '')}:"
+            current.append(hashlib.sha256((prefix + text).encode()).hexdigest()[:16])
+            current_chars.append(len(prefix + text))
+
+        # 找到最长公共前缀
+        overlap = 0
+        overlap_chars = 0
+        for i, h in enumerate(current):
+            if i < len(self._prev_block_hashes) and h == self._prev_block_hashes[i]:
+                overlap += 1
+                overlap_chars += current_chars[i]
+            else:
+                break
+
+        total_chars = sum(current_chars)
+        self._prev_block_hashes = current
+        return overlap, len(current), overlap_chars, total_chars
 
     def release(self):
         if self._model_id and self._model_id.startswith("human"):
@@ -218,7 +304,7 @@ class APIClient:
     def call(self, messages: list, system=None, tools=None,
              max_tokens: int = 4096, bypass_energy: bool = False,
              extra_params: dict = None, stop_sequences: list = None,
-             text_callback=None):
+             text_callback=None, thinking_callback=None):
         """调用 API，返回 Message 对象。text_callback 可选，支持流式。"""
         # ── 人类模型：展示上下文，阻塞读 stdin ──
         if self._model_id and self._model_id.startswith("human"):
@@ -240,6 +326,22 @@ class APIClient:
 
         self._dump("req", kwargs)
 
+        # ── 缓存命中率：对比当前 messages 与上一次的前缀重叠 ──
+        overlap_blocks, total_blocks, hit_chars, total_chars = self._compute_prefix_overlap(
+            kwargs.get("messages", []), kwargs.get("system")
+        )
+        hit_pct = overlap_blocks / total_blocks * 100 if total_blocks else 0
+        est_hit_tokens = hit_chars // 4  # char/4 估算
+        est_new_tokens = (total_chars - hit_chars) // 4
+        if total_blocks > 0:
+            self._cache_hit_log.append({
+                "overlap": overlap_blocks, "total": total_blocks,
+                "hit_pct": hit_pct, "hit_tokens_est": est_hit_tokens,
+                "new_tokens_est": est_new_tokens,
+            })
+        print(f"  [Cache] prefix overlap: {overlap_blocks}/{total_blocks} blocks ({hit_pct:.0f}%) "
+              f"~{est_hit_tokens} hit ~{est_new_tokens} new")
+
         elapsed = time.time() - self._last_call_time
         if elapsed < self.cfg.RATE_LIMIT:
             time.sleep(self.cfg.RATE_LIMIT - elapsed)
@@ -248,13 +350,24 @@ class APIClient:
         overload_retries = 0
         max_overload = max_retries * 3
 
-        # ── 流式模式：text_callback + stream.get_final_message() ──
+        # ── 流式模式：text_callback + thinking_callback + stream.get_final_message() ──
         if text_callback:
             kwargs.pop("stop_sequences", None)  # streaming 不支持 stop_sequences
+            thinking_buffer = []
             with self.client.messages.stream(**kwargs) as stream:
-                for text in stream.text_stream:
-                    text_callback(text)
+                for event in stream:
+                    if event.type == "content_block_delta":
+                        delta = event.delta
+                        dt = getattr(delta, "type", "")
+                        if dt == "text_delta" and text_callback:
+                            text_callback(delta.text)
+                        elif dt == "thinking_delta" and thinking_callback:
+                            thinking_callback(delta.thinking)
+                            thinking_buffer.append(delta.thinking)
                 result = stream.get_final_message()
+            # 把 thinking 内容附加到 result，方便调用者读取
+            if thinking_buffer and hasattr(result, 'content'):
+                result._thinking_text = "".join(thinking_buffer)
             if result and hasattr(result, 'usage') and self.em:
                 self._record_usage(result, bypass_energy)
             self.release()

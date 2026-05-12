@@ -25,12 +25,13 @@ from agent_kernel_glue import (APIClient, AnthropicCacheProvider, CacheProvider,
     FlowchartRecorder, AgentEventBus, _get_event_bus, SavepointManager,
     PlanState, PlanContext, SubAgentEventType, SubAgentEvent)
 from agent_process_executor import (ToolExecutor, TOOL_DEFINITIONS,
-    _build_cached_tools, energy_hooks, _spawn_deduct, _spawn_settle,
+    _build_cached_tools, _tier_tool_def, energy_hooks, _spawn_deduct, _spawn_settle,
     _cmd_deduct, _cmd_refund, _skill_deduct)
 from agent_scheduler_energy import BayesianEnergyManager, StepEstimator, ContextTooLongError
 from agent_memory_l2 import L2Cache
 from agent_memory_report import NodeReport
 from agent_kernel_router import get_router
+from opcode_parser import parse_opcodes, opcode_to_tool_call, generate_opcode_reference
 
 _http_client = httpx.Client(proxy=None, timeout=60.0, follow_redirects=True, trust_env=False)
 
@@ -49,7 +50,9 @@ class Agent:
                  l2_cache: 'L2Cache' = None,
                  model_spec: dict = None,
                  can_spawn: bool = True,
-                 context_budget: int = None):
+                 context_budget: int = None,
+                 monitor_sink=None,
+                 text_callback=None):
         self.work_dir = work_dir or Config.WORK_DIR
         os.makedirs(self.work_dir, exist_ok=True)
         self.depth = depth
@@ -57,6 +60,8 @@ class Agent:
         self.parent = parent
         self.l2_cache = l2_cache
         self.can_spawn = can_spawn
+        self.monitor_sink = parent.monitor_sink if parent and hasattr(parent, 'monitor_sink') else monitor_sink
+        self.text_callback = parent.text_callback if parent and hasattr(parent, 'text_callback') else text_callback
         self.child_model_spec = None
         self.intervention_budget = int(os.getenv("INTERVENTION_BUDGET", "3"))  # 人类干预预算
         self.can_prune = True  # 允许剪枝（机械+未来 LLM 剪枝的权限开关）
@@ -189,6 +194,9 @@ class Agent:
         self.active_savepoint: Optional[SavepointMeta] = None
         self.savepoint_history: list[SavepointMeta] = []
         self._just_popped = False  # pop 后中断当前 tool loop
+
+        # 补充型工具定义：{tool_name: tier}，初始 Tier 1，失败时升级
+        self._tool_tiers: dict[str, int] = {}
 
     # ---- 状态持久化 ----
     @classmethod
@@ -995,6 +1003,13 @@ class Agent:
             platform_block["cache_control"] = cc  # 缓存断点 #2: system
         system_blocks.append(platform_block)
 
+        # OPCode 精简调用格式参考
+        if Config.COMPACT_OPCODES:
+            opcode_block = {"type": "text", "text": generate_opcode_reference()}
+            if cc:
+                opcode_block["cache_control"] = cc  # 共享缓存断点
+            system_blocks.append(opcode_block)
+
         messages = []
         frames = list(self.stack)
 
@@ -1028,9 +1043,8 @@ class Agent:
             desc = done_subs[i]['desc'] if i < len(done_subs) else f"Step {f.step_id}"
             messages.append({"role": "user", "content": f"执行: {desc}"})
             if getattr(f, 'failed', False):
-                # 失败步骤：只留一行摘要，不保留完整 tool 调用链
-                fail_preview = f.content[:100].replace("\n", " ")
-                messages.append({"role": "assistant", "content": f"[Step {f.step_id} FAILED] {fail_preview}"})
+                # 失败步骤：保留完整内容 + 标记，保持前缀稳定（缓存友好）
+                messages.append({"role": "assistant", "content": f"[Step {f.step_id} FAILED]\n{f.content}"})
             elif f.type == "pointer":
                 if getattr(f, 'expanded', False):
                     messages.append({"role": "assistant", "content": f.content})
@@ -1070,8 +1084,12 @@ class Agent:
         # 多轮消息格式（缓存友好）
         base_messages, system_blocks = self._build_messages()
         cached_tools = _build_cached_tools(self._cache_provider)
-        # Root 有完整描述，子节点继承理解 -> 去所有 desc
-        if self.depth > 0:
+        # 补充型工具定义：按 tier 精简，失败时升级
+        if self._tool_tiers:
+            cached_tools = [_tier_tool_def(t, self._tool_tiers.get(t.get("name"), 1))
+                            for t in cached_tools]
+        elif self.depth > 0:
+            # 子节点无 tier 追踪时仍用旧逻辑：去所有 desc
             def _strip_desc(t):
                 t = {k: v for k, v in t.items() if k != "description"}
                 if "input_schema" in t and "properties" in t["input_schema"]:
@@ -1160,6 +1178,20 @@ class Agent:
             finally:
                 self._api.release()
 
+            # 流式回调：把本次 API 响应推给前端（思考 + 正文）
+            if self.text_callback:
+                try:
+                    parts = []
+                    for b in response.content:
+                        if hasattr(b, 'thinking') and b.thinking:
+                            parts.append(f"> 💭 {b.thinking}")
+                        elif hasattr(b, 'text') and b.text:
+                            parts.append(b.text)
+                    if parts:
+                        self.text_callback("\n\n".join(parts))
+                except Exception:
+                    pass
+
             # ── A/B 分离：首次响应含 plan (A) + 执行 (B) ──────────────────
             plan_just_parsed = False
             if self._plan.state == PlanState.PENDING:
@@ -1171,38 +1203,75 @@ class Agent:
                 self._plan.prompt = ""  # 清除，避免后续步骤重复注入
                 plan_just_parsed = True
 
+            # ── OPCode 预扫描（在 stop_reason 分支前，统一处理两种路径）──
+            import uuid as _uuid
+            from types import SimpleNamespace as _NS
+            _opcode_calls_all = []  # (tc_dict, block_ns)
+
+            if Config.COMPACT_OPCODES:
+                text_content = "\n".join(b.text for b in response.content
+                                         if b.type == "text" and hasattr(b, 'text'))
+                opcode_calls, opcode_remaining = parse_opcodes(text_content)
+                if opcode_calls:
+                    print(f"  [OPCode] {len(opcode_calls)} tools from "
+                          f"{'end_turn' if response.stop_reason == 'end_turn' else 'text'}")
+                    for tc in opcode_calls:
+                        ns = _NS(type="tool_use", id=f"opc_{_uuid.uuid4().hex[:12]}",
+                                 name=tc['tool'], input=tc['args'])
+                        _opcode_calls_all.append((tc, ns))
+
+            # ── 构建 tool_blocks（两种来源：API tool_use + OPCode）──
+            tool_blocks = []
+            _opcode_from_end_turn = False
+
             if response.stop_reason == "tool_use":
                 tool_blocks = [b for b in response.content if b.type == "tool_use"]
-                # 厂商适配：提取 reasoning_content（DeepSeek/Kimi 思考链跨轮保留）
-                extra_msg = self._api._adapter.post_process(response)
-                # A/B 分离：plan 文本进 stack[1]（通过 PlanContext.reasoning），消息里只留简短标记
-                if plan_just_parsed:
-                    clean_content = [{"type": "text", "text": "[Plan recorded. Executing...]"}]
-                    # 保留 thinking 块（DeepSeek/Kimi 跨轮必须）
-                    for b in response.content:
-                        if b.type == "thinking":
-                            clean_content.append({"type": "thinking",
-                                                  "thinking": b.thinking,
-                                                  "signature": b.signature})
-                        elif b.type == "tool_use":
-                            clean_content.append({"type": "tool_use",
-                                                  "id": b.id, "input": b.input, "name": b.name})
-                    am = {"role": "assistant", "content": clean_content}
-                    if extra_msg.get("reasoning_content"):
-                        am["reasoning_content"] = extra_msg["reasoning_content"]
-                    messages.append(am)
-                else:
-                    am = {"role": "assistant", "content": response.content}
-                    if extra_msg.get("reasoning_content"):
-                        am["reasoning_content"] = extra_msg["reasoning_content"]
-                    messages.append(am)
+            elif _opcode_calls_all:
+                # end_turn 中有 opcode → 构建 assistant 消息，进入工具执行
+                am_content = []
+                if opcode_remaining.strip():
+                    am_content.append({"type": "text", "text": opcode_remaining})
+                for _, ns in _opcode_calls_all:
+                    am_content.append({"type": "tool_use", "id": ns.id,
+                                       "name": ns.name, "input": ns.input})
+                messages.append({"role": "assistant", "content": am_content})
+                _opcode_from_end_turn = True
+
+            # 追加 opcode 到 tool_blocks（两种路径都走这里）
+            for _, ns in _opcode_calls_all:
+                if ns not in tool_blocks:
+                    tool_blocks.append(ns)
+
+            if tool_blocks:
+                # ── 统一工具执行路径（tool_use + end_turn opcode）──
+
+                # assistant 消息（tool_use 路径需要补充）
+                if not _opcode_from_end_turn:
+                    extra_msg = self._api._adapter.post_process(response)
+                    if plan_just_parsed:
+                        clean_content = [{"type": "text", "text": "[Plan recorded. Executing...]"}]
+                        for b in response.content:
+                            if b.type == "thinking":
+                                clean_content.append({"type": "thinking",
+                                                      "thinking": b.thinking,
+                                                      "signature": b.signature})
+                            elif b.type == "tool_use":
+                                clean_content.append({"type": "tool_use",
+                                                      "id": b.id, "input": b.input, "name": b.name})
+                        am = {"role": "assistant", "content": clean_content}
+                        if extra_msg.get("reasoning_content"):
+                            am["reasoning_content"] = extra_msg["reasoning_content"]
+                        messages.append(am)
+                    else:
+                        am = {"role": "assistant", "content": response.content}
+                        if extra_msg.get("reasoning_content"):
+                            am["reasoning_content"] = extra_msg["reasoning_content"]
+                        messages.append(am)
 
                 # 并行工具补贴：无论多少个工具，只计 1 次，费用 ×3
-                # 合并 plan+execute 时免除工具费（省下的 plan 调用抵消）
                 tool_count = len(tool_blocks)
                 if plan_just_parsed:
                     print(f"  [Tool] {tool_count} tools (plan-merged, tool cost WAIVED)")
-                    # 工具费完全免除——省下的 plan API 调用已抵消
                 elif tool_count == 1:
                     if not self.energy_manager.charge(Config.TOOL_ENERGY_COST):
                         print(f"  [Tool] Energy depleted, cannot start tool")
@@ -1237,12 +1306,11 @@ class Agent:
                         total_deduct = invest_per * spawn_n + reserve
                         if em.charge(total_deduct):
                             em._reserve_stack.append(reserve)
-                            child_pool_energy = em.energy  # 扣留后的父流动资金 = 子 CoW 基准
+                            child_pool_energy = em.energy
                             child_total = child_pool_energy * (1 - Config.SPAWN_RESERVE_RATIO)
                             print(f"  [ParallelSpawn] {spawn_n} children, reserve={reserve:.0f}E, "
                                   f"invest each={invest_per:.0f}E, child pool={child_total:.0f}E")
 
-                            # L2 同级共享缓存：每层分叉一个独立命名空间
                             ns_id = f"l2_{self.agent_id}_{int(time.time()) % 100000}"
                             l2_cache = L2Cache(ns_id, self.scope)
                             print(f"  [L2] Created {ns_id} for {spawn_n} siblings")
@@ -1261,12 +1329,10 @@ class Agent:
                                     block_id, result = future.result()
                                     parallel_spawn_results[block_id] = result
 
-                            # 释放保底
                             if em._reserve_stack:
                                 r = em._reserve_stack.pop()
                                 em.credit(r)
                                 print(f"  [ParallelSpawn] Reserve released: {r:.0f}E -> energy {em.energy:.0f}")
-                            # 结算投资（explore/exploit）
                             for bid, r in parallel_spawn_results.items():
                                 mode = r.get("_mode", "exploit")
                                 success = r.get("success", False)
@@ -1283,7 +1349,6 @@ class Agent:
                                         em.spend(invest_per * 0.5)
                                 if not success:
                                     em.update_spawn(False)
-                            # 吸收结果
                             for bid, r in parallel_spawn_results.items():
                                 if r.get("success") and self:
                                     output = r.get("output", "")
@@ -1294,7 +1359,6 @@ class Agent:
                                             break
                                     self._absorb_child_result(output, task_desc)
                                     self.energy_manager.update_spawn(True)
-                                    # 经验上提
                                     child_exp = r.get("_child_experiences", [])
                                     if child_exp:
                                         self._pending_experiences.extend(child_exp)
@@ -1307,7 +1371,6 @@ class Agent:
                                                 self.reports_history.append(NodeReport.from_dict(rd))
                                             except Exception:
                                                 pass
-                            # 同期组完成，销毁 L2
                             try:
                                 l2_cache.destroy()
                                 print(f"  [L2] Destroyed {ns_id}")
@@ -1320,9 +1383,8 @@ class Agent:
                         for b in spawn_blocks:
                             parallel_spawn_results[b.id] = {"success": False, "output": "Spawn conditions not met (low energy/budget)"}
 
-                # ── 执行所有工具 ──────────────────────────────────────
-                # ── 只读工具并行（read_file, list_dir, recall, read_peer）──
-                READ_ONLY_TOOLS = {"read_file", "list_dir", "recall", "read_peer"}
+                # ── 执行所有工具（只读并行，写串行）──
+                READ_ONLY_TOOLS = {"read_file", "list_dir", "recall", "read_peer", "view_image"}
                 read_blocks = [b for b in tool_blocks if b.name in READ_ONLY_TOOLS]
                 write_blocks = [b for b in tool_blocks if b.name not in READ_ONLY_TOOLS
                                 and b.id not in parallel_spawn_results]
@@ -1379,6 +1441,8 @@ class Agent:
                     status = "ok" if result["success"] else "error"
                     print(f"  [Tool result] {block.name}({args_str}) status={status}: "
                           f"{str(result.get('output', ''))[:80]}...")
+                    if self.monitor_sink:
+                        self.monitor_sink({"tool": block.name})
 
                     merged_node = self.flowchart.merged_tool(
                         step_node, block.name, self.step_counter,
@@ -1397,6 +1461,12 @@ class Agent:
                     }
                     if result.get("subtask_complete"):
                         tr["subtask_complete"] = True
+                    # 补充型工具定义：失败时自动升级 tier（被动机制，_tier 是主动机制）
+                    if not result["success"]:
+                        cur = self._tool_tiers.get(block.name, 1)
+                        if cur < 3:
+                            self._tool_tiers[block.name] = cur + 1
+                            print(f"  [Tool tier] {block.name} auto-promoted to tier {cur + 1} (tool failed)")
                     tool_results.append(tr)
 
                 messages.append({"role": "user", "content": tool_results})
@@ -1410,6 +1480,14 @@ class Agent:
                 if subtask_done:
                     final_text = "✅ 任务完成"
                     print(f"  [Auto-complete] subtask_complete signal detected")
+                    if self.monitor_sink:
+                        em = self.energy_manager
+                        cs = self._api.cache_stats
+                        self.monitor_sink({
+                            "step": round_num + 1,
+                            "energy": round(em.energy),
+                            "cache_pct": round(cs['hit_pct']) if cs['total_input'] > 0 else None,
+                        })
                     break
 
                 # Post-append 消息总量守卫：超过 MAX_MESSAGE_CHARS 则截断最旧工具结果
@@ -1421,7 +1499,19 @@ class Agent:
                 budget_pct = em.total_spent / em.total_energy * 100 if em.total_energy > 0 else 0
                 tok_info = f" | Tokens {em.total_tokens}" if em.total_tokens > 0 else ""
                 ctx_info = f" | ctx~{em.estimated_context_usage:.0%}" if em._cumulative_input > 0 else ""
-                print(f"  [{round_num+1}/{self.max_tool_rounds} rounds | Budget {budget_pct:.0f}% | Energy {em.energy:.0f}{tok_info}{ctx_info}]")
+                cs = self._api.cache_stats
+                cache_info = f" | Cache {cs['hit_pct']:.0f}%" if cs['total_input'] > 0 else ""
+                print(f"  [{round_num+1}/{self.max_tool_rounds} rounds | Budget {budget_pct:.0f}% | Energy {em.energy:.0f}{tok_info}{ctx_info}{cache_info}]")
+                if self.monitor_sink:
+                    self.monitor_sink({
+                        "step": round_num + 1,
+                        "max_steps": self.max_tool_rounds,
+                        "budget_pct": round(budget_pct),
+                        "energy": round(em.energy),
+                        "tokens": em.total_tokens or None,
+                        "ctx_pct": round(em.estimated_context_usage * 100) if em._cumulative_input > 0 else None,
+                        "cache_pct": round(cs['hit_pct']) if cs['total_input'] > 0 else None,
+                    })
 
                 # 存档点 pop：状态已恢复，中断工具循环
                 if getattr(self, '_just_popped', False):
@@ -1430,9 +1520,8 @@ class Agent:
 
                 continue
 
-            # stop_reason == "end_turn"
+            # stop_reason == "end_turn"，无 opcode
             final_text = self._extract_text(response)
-            # plan 刚解析但无工具调用 -> 标记需要重放，让 run() 重新执行第一个子任务
             if plan_just_parsed:
                 self._plan.state = PlanState.NEEDS_REPLAY
                 print(f"  [Plan] Plan-only response (no tool calls), will replay first subtask")
@@ -1440,6 +1529,19 @@ class Agent:
 
         if not final_text:
             final_text = "(no response)"
+
+        # 监控 sink：工具循环结束后统一推送一次完整状态
+        if self.monitor_sink:
+            em = self.energy_manager
+            cs = self._api.cache_stats
+            self.monitor_sink({
+                "step": self.step_counter,
+                "energy": round(em.energy),
+                "tokens": em.total_tokens or None,
+                "cache_pct": round(cs['hit_pct']) if cs['total_input'] > 0 else None,
+                "ctx_pct": round(em.estimated_context_usage * 100) if em._cumulative_input > 0 else None,
+                "budget_pct": round(em.total_spent / em.total_energy * 100) if em.total_energy > 0 else None,
+            })
 
         # 存档点 pop 后跳过 step_detail 写入（栈已恢复到存档点状态）
         if getattr(self, '_just_popped', False):
@@ -2139,8 +2241,9 @@ class Agent:
                 elif plan_was_parsed:
                     self._plan.state = PlanState.IDLE
 
-                # 空响应检测：长度 < 50 视为实质失败
-                if not result or len(result.strip()) < 50:
+                # 空响应检测：plan 跳过 + 简单任务时放行短回答
+                _is_trivial = self._skip_plan_resolved and total_steps <= 2
+                if not result or (len(result.strip()) < 50 and not _is_trivial):
                     print(f"  [Warning] Empty/minimal response ({len(result.strip()) if result else 0} chars)")
                     self.energy_manager.update_subtask(f"sub_{sub_idx}", False)
                     subtask['done'] = False
@@ -2278,12 +2381,20 @@ class Agent:
                 except Exception as e:
                     print(f"  [Emergency] Failed: {e}")
 
-        # 经验记录（轻量收集，不调 LLM）
-        self._collect_experience_metadata(
-            task=task, plan=plan_text, step_count=total_steps,
-            success=all(s.get('done') for s in self.subtask_queue),
-            final_result=last_result
+        # ── skip 机制：plan 跳过 + 简单任务 → 跳过经验收集 ──
+        _skip_experience = (
+            total_steps <= 2
+            and not any(tc for tc in self._current_tool_calls)
         )
+        if self._skip_plan_resolved and _skip_experience:
+            print("  [Experience] skipped (plan skipped + simple task)")
+        else:
+            task_success = all(s.get('done') for s in self.subtask_queue)
+            self._collect_experience_metadata(
+                task=task, plan=plan_text, step_count=total_steps,
+                success=task_success,
+                final_result=last_result
+            )
 
         # 保存对话历史
         self.conversation_history.append({"q": task, "a": last_result})

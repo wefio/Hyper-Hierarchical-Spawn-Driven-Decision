@@ -12,6 +12,7 @@ import httpx
 
 from config import Config
 from skill import SkillManager
+from agent import Agent
 
 def check_connection(client: anthropic.Anthropic) -> bool:
     """用最短请求验证 API 可达，529 过载自动重试"""

@@ -46,6 +46,7 @@ class Config:
     MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "100"))
     REWARD_STEP_TIER = int(os.getenv("REWARD_STEP_TIER", "50"))  # ≤此步数全额奖励
     MAX_SPAWN_DEPTH = int(os.getenv("MAX_SPAWN_DEPTH", "0"))  # 0=不限制
+    COMPACT_OPCODES = os.getenv("COMPACT_OPCODES", "1") == "1"  # 启用 @opcode 精简调用
 
     # ---- 路径 (基于脚本所在目录, 非 CWD) ----
     _BASE = os.path.dirname(os.path.abspath(__file__))

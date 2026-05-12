@@ -201,6 +201,63 @@ TOOL_DEFINITIONS = [
             "required": ["code", "mode"]
         }
     },
+    {
+        "name": "run_script",
+        "description": (
+            "Universal script executor. Call existing scripts or inline content. "
+            "Supports background (non-blocking) and scheduled (deferred/periodic) execution. "
+            "Python scripts auto-route to ipython for inline content. "
+            "Actions: run (execute), status (check job), list (all jobs), cancel (kill job)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["run", "status", "list", "cancel"],
+                    "description": "Action to perform"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Path to existing script file (for run)"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Inline script content (auto-saved to scripts/ dir, for run)"
+                },
+                "args": {
+                    "type": "string",
+                    "description": "Command-line arguments for the script"
+                },
+                "lang": {
+                    "type": "string",
+                    "enum": ["python", "shell", "node", "batch", "auto"],
+                    "description": "Script language (default: auto-detect from extension)"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run in background (non-blocking). Default false."
+                },
+                "delay": {
+                    "type": "integer",
+                    "description": "Delay in seconds before execution (for scheduled runs)"
+                },
+                "interval": {
+                    "type": "integer",
+                    "description": "Repeat interval in seconds (0 = one-shot)"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max execution time in seconds (default 60)"
+                },
+                "job_id": {
+                    "type": "string",
+                    "description": "Job ID for status/cancel actions"
+                }
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 # Merge plugin tool definitions
@@ -223,6 +280,48 @@ def _build_cached_tools(cache_provider: CacheProvider) -> list:
         else:
             tools.append(t)
     return tools
+
+
+def _tier_tool_def(tool_def: dict, tier: int) -> dict:
+    """按 tier 等级精简工具定义。
+    - tier 1 (minimal): name + 参数名+type + _tier 隐藏参数
+    - tier 2 (standard): name + 简短 description + 参数 type + required + _tier
+    - tier 3 (full): 完整定义（不含 _tier）
+    """
+    if tier >= 3:
+        return tool_def
+    name = tool_def.get("name", "")
+    schema = tool_def.get("input_schema", {})
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+
+    # tier 1/2: 精简 properties — 只保留 type
+    slim_props = {pn: {"type": pi.get("type", "string")}
+                  for pn, pi in properties.items()}
+    # 注入 _tier 隐藏参数（默认不用填）
+    slim_props["_tier"] = {"type": "integer"}
+    new_schema = {"type": "object", "properties": slim_props}
+    if required:
+        new_schema["required"] = required
+
+    out = {"name": name, "input_schema": new_schema}
+    # description：标注当前 tier 和可选项
+    tier_info = f"tier={tier}, available: 1,2,3"
+    if tier == 2:
+        desc = tool_def.get("description", "")
+        first_sent = desc.split(".")[0][:80]
+        out["description"] = f"{first_sent}. {tier_info}"
+    else:
+        out["description"] = tier_info
+    # 保留 cache_control 标记
+    if "cache_control" in tool_def:
+        out["cache_control"] = tool_def["cache_control"]
+    return out
+
+def build_tools_by_tier(cache_provider: CacheProvider, tool_tiers: dict) -> list:
+    """根据每个工具的当前 tier 组装工具列表。"""
+    base = _build_cached_tools(cache_provider)
+    return [_tier_tool_def(t, tool_tiers.get(t.get("name"), 1)) for t in base]
 
 def _get_energy_mgr(agent_context: dict) -> 'BayesianEnergyManager':
     """从 agent_context 中提取能量管理器"""
@@ -353,6 +452,7 @@ class ToolExecutor:
             "recall": ToolExecutor._recall,
             "read_peer": ToolExecutor._read_peer,
             "ipython": ToolExecutor._ipython,
+            "run_script": ToolExecutor._run_script,
         }
         # Merge plugin handlers
         for plugin in _PLUGINS:
@@ -361,6 +461,28 @@ class ToolExecutor:
         handler = handlers.get(name)
         if not handler:
             return {"success": False, "output": f"Unknown tool: {name}. Available: {', '.join(handlers.keys())}"}
+
+        # ── 拦截 _tier 隐藏参数：升级工具定义详细程度 ──
+        parent = (agent_context or {}).get("parent_agent")
+        requested_tier = args.pop("_tier", None)
+        if requested_tier and parent and hasattr(parent, "_tool_tiers"):
+            cur = parent._tool_tiers.get(name, 1)
+            new_tier = max(cur, min(int(requested_tier), 3))
+            if new_tier > cur:
+                parent._tool_tiers[name] = new_tier
+                print(f"  [Tool tier] {name} upgraded to tier {new_tier} by model request")
+                # 返回完整定义作为反馈
+                full_def = next((t for t in TOOL_DEFINITIONS if t.get("name") == name), None)
+                if full_def:
+                    detail = f"[定义已升级至 tier {new_tier}] {full_def.get('description', '')}"
+                    for pn, pi in full_def.get("input_schema", {}).get("properties", {}).items():
+                        if pn == "_tier":
+                            continue
+                        desc = pi.get("description", pi.get("type", ""))
+                        detail += f"\n  {pn}: {desc}"
+                    detail += f"\n下次调用将使用 tier {new_tier} 定义。"
+                    return {"success": True, "output": detail}
+
         try:
             result = handler(args, budget, agent_context or {})
             # ── 记录 tool 调用序列（供技能保存）──
@@ -757,6 +879,192 @@ class ToolExecutor:
             finally:
                 import shutil
                 shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── run_script: 通用脚本执行 + 后台/定时 ──
+    _SCRIPT_JOBS: Dict[str, dict] = {}  # module-level job store
+    _SCRIPT_COUNTER = 0
+
+    @staticmethod
+    def _run_script(args: dict, budget: int, agent_context: dict = None) -> dict:
+        """通用脚本执行工具。支持：调用已有脚本 / 内联内容 / 后台 / 定时。"""
+        import threading
+        import uuid as _uuid
+        import tempfile
+        action = args.get("action", "run")
+
+        # ── list: 列出所有作业 ──
+        if action == "list":
+            jobs = ToolExecutor._SCRIPT_JOBS
+            if not jobs:
+                return {"success": True, "output": "No jobs."}
+            lines = []
+            for jid, j in jobs.items():
+                age = int(time.time() - j["created_at"])
+                lines.append(f"[{jid}] {j['status']} | {j['script'][:40]} | {age}s ago"
+                             + (f" | exit={j.get('exit_code')}" if j.get('exit_code') is not None else ""))
+            return {"success": True, "output": "\n".join(lines)}
+
+        # ── status: 查询作业状态 ──
+        if action == "status":
+            job_id = args.get("job_id", "")
+            job = ToolExecutor._SCRIPT_JOBS.get(job_id)
+            if not job:
+                return {"success": False, "output": f"Job {job_id} not found"}
+            result = {"success": True, "output": f"Status: {job['status']}"}
+            if job["status"] in ("done", "error"):
+                output = ""
+                if job.get("output_file") and os.path.exists(job["output_file"]):
+                    output = open(job["output_file"], encoding="utf-8", errors="replace").read()
+                    output = smart_truncate(output, budget)
+                result["output"] = f"[{job['status']}] exit={job.get('exit_code')}\n{output}"
+                result["success"] = job["status"] == "done"
+            return result
+
+        # ── cancel: 取消作业 ──
+        if action == "cancel":
+            job_id = args.get("job_id", "")
+            job = ToolExecutor._SCRIPT_JOBS.get(job_id)
+            if not job:
+                return {"success": False, "output": f"Job {job_id} not found"}
+            if job["status"] == "running" and job.get("process"):
+                try:
+                    job["process"].kill()
+                    job["status"] = "cancelled"
+                except Exception:
+                    pass
+            elif job["status"] == "scheduled":
+                job["status"] = "cancelled"
+            return {"success": True, "output": f"Job {job_id}: {job['status']}"}
+
+        # ── run: 执行脚本 ──
+        path = args.get("path", "")
+        content = args.get("content", "")
+        script_args = args.get("args", "")
+        lang = args.get("lang", "auto")
+        background = args.get("background", False)
+        delay = args.get("delay", 0)
+        interval = args.get("interval", 0)
+        timeout = min(args.get("timeout", 60), 300)
+
+        # Python 内联代码 → 路由到 ipython（复用已有沙盒）
+        if content and (lang == "python" or (lang == "auto" and not path)):
+            parent = (agent_context or {}).get("parent_agent")
+            if parent:
+                ipython_args = {"code": content, "mode": "isolated", "timeout": timeout}
+                if script_args:
+                    ipython_args["code"] = f"import sys; sys.argv = {script_args.split()}\n{content}"
+                if not background and not delay and not interval:
+                    return ToolExecutor._ipython(ipython_args, budget, agent_context)
+
+        # 解析脚本路径
+        script_path = path
+        if content and not path:
+            # 内联内容 → 写入临时脚本文件
+            if os.name == "nt":
+                ext_map = {"python": ".py", "shell": ".ps1", "node": ".js", "batch": ".bat"}
+            else:
+                ext_map = {"python": ".py", "shell": ".sh", "node": ".js", "batch": ".bat"}
+            if lang == "auto":
+                lang = "python"  # default
+            ext = ext_map.get(lang, ".ps1" if os.name == "nt" else ".sh")
+            scripts_dir = getattr(Config, 'SCRIPTS_DIR', tempfile.gettempdir())
+            os.makedirs(scripts_dir, exist_ok=True)
+            ToolExecutor._SCRIPT_COUNTER += 1
+            fname = f"_auto_{ToolExecutor._SCRIPT_COUNTER}_{int(time.time()) % 100000}{ext}"
+            script_path = os.path.join(scripts_dir, fname)
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        elif path:
+            if lang == "auto":
+                ext = os.path.splitext(path)[1].lower()
+                lang = {".py": "python", ".sh": "shell", ".js": "node",
+                        ".bat": "batch", ".cmd": "batch"}.get(ext, "shell")
+        else:
+            return {"success": False, "output": "Need path or content"}
+
+        # 构建命令
+        interp_map = {"python": "python", "shell": "bash", "node": "node", "batch": "cmd /c"}
+        if os.name == "nt":
+            if lang == "shell":
+                interp_map["shell"] = "powershell -File"
+            elif lang == "batch":
+                interp_map["batch"] = "cmd /c"
+        interp = interp_map.get(lang, "bash")
+        cmd = f'{interp} "{script_path}"'
+        if script_args:
+            cmd += f" {script_args}"
+
+        # 作业 ID
+        job_id = f"job_{_uuid.uuid4().hex[:8]}"
+        output_file = tempfile.mktemp(suffix=".out", prefix=f"script_{job_id}_")
+        job = {
+            "id": job_id, "status": "scheduled" if delay else "running",
+            "script": script_path, "cmd": cmd, "lang": lang,
+            "output_file": output_file, "process": None,
+            "created_at": time.time(), "started_at": None, "finished_at": None,
+            "exit_code": None, "delay": delay, "interval": interval,
+        }
+        ToolExecutor._SCRIPT_JOBS[job_id] = job
+
+        def _execute_job():
+            """在线程中执行脚本，捕获输出到文件。"""
+            job["status"] = "running"
+            job["started_at"] = time.time()
+            try:
+                with open(output_file, "w", encoding="utf-8") as out_f:
+                    proc = subprocess.Popen(
+                        cmd, shell=True, stdout=out_f, stderr=subprocess.STDOUT,
+                        cwd=os.path.dirname(script_path) or None)
+                    job["process"] = proc
+                    proc.wait(timeout=timeout)
+                    job["exit_code"] = proc.returncode
+                    job["status"] = "done" if proc.returncode == 0 else "error"
+            except subprocess.TimeoutExpired:
+                if job.get("process"):
+                    job["process"].kill()
+                job["status"] = "timeout"
+                job["exit_code"] = -1
+            except Exception as e:
+                job["status"] = "error"
+                with open(output_file, "w") as f:
+                    f.write(f"Error: {e}")
+            finally:
+                job["finished_at"] = time.time()
+
+        def _scheduler():
+            """延迟 + 周期调度线程。"""
+            if delay > 0:
+                time.sleep(delay)
+            if ToolExecutor._SCRIPT_JOBS.get(job_id, {}).get("status") == "cancelled":
+                return
+            while True:
+                _execute_job()
+                if interval <= 0:
+                    break
+                time.sleep(interval)
+                if ToolExecutor._SCRIPT_JOBS.get(job_id, {}).get("status") == "cancelled":
+                    break
+
+        if background or delay > 0 or interval > 0:
+            t = threading.Thread(target=_scheduler, daemon=True)
+            t.start()
+            info = f"Job {job_id} started"
+            if delay > 0:
+                info += f" (delay={delay}s)"
+            if interval > 0:
+                info += f" (interval={interval}s)"
+            info += f"\nScript: {script_path}\nUse run_script(action='status', job_id='{job_id}') to check."
+            return {"success": True, "output": info}
+        else:
+            # 同步执行
+            _execute_job()
+            output = ""
+            if os.path.exists(output_file):
+                output = open(output_file, encoding="utf-8", errors="replace").read()
+                output = smart_truncate(output, budget)
+            return {"success": job["status"] == "done",
+                    "output": f"[{job['status']}] exit={job.get('exit_code')}\n{output}",
+                    "exit_code": job.get("exit_code")}
 
     @staticmethod
     def _savepoint(args: dict, budget: int, agent_context: dict = None) -> dict:

@@ -124,9 +124,14 @@ class DeepSeekAdapter(ProviderAdapter):
             u = response.usage
             raw_meta["input_tokens"] = getattr(u, 'input_tokens', 0) or 0
             raw_meta["output_tokens"] = getattr(u, 'output_tokens', 0) or 0
-            # DeepSeek 用 prompt_cache_hit_tokens
-            raw_meta["cache_read_tokens"] = getattr(u, 'prompt_cache_hit_tokens', 0) or 0
-            raw_meta["cache_write_tokens"] = getattr(u, 'prompt_cache_miss_tokens', 0) or 0
+            # DeepSeek: Anthropic SDK 返回 cache_read_input_tokens，
+            #           原生 API 返回 prompt_cache_hit_tokens
+            raw_meta["cache_read_tokens"] = (
+                getattr(u, 'cache_read_input_tokens', 0)
+                or getattr(u, 'prompt_cache_hit_tokens', 0) or 0)
+            raw_meta["cache_write_tokens"] = (
+                getattr(u, 'cache_creation_input_tokens', 0)
+                or getattr(u, 'prompt_cache_miss_tokens', 0) or 0)
         return raw_meta
 
 

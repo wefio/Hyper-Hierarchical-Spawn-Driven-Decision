@@ -2,3 +2,39 @@
 .cb-collapsed { max-height: 16em !important; overflow: hidden !important; position: relative; }
 .cb-collapsed::after { content: "\25BC Expand"; position: absolute; bottom: 0; left: 0; right: 0; padding: 0.5em; text-align: center; cursor: pointer; font-size: 0.8rem; color: #888; background: linear-gradient(transparent, var(--card, #fff) 70%); }
 .cb-expanded { max-height: none !important; }
+
+/* ── HHSDD Monitor: 固定状态栏 ── */
+#hhsdd-monitor {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    height: 30px;
+    background: rgba(20, 20, 25, 0.95);
+    color: #ccc;
+    font: 11px/30px "Cascadia Code", "Fira Code", Consolas, monospace;
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    gap: 16px;
+    z-index: 9999;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    backdrop-filter: blur(12px);
+    user-select: none;
+    transition: opacity 0.4s, transform 0.4s;
+}
+#hhsdd-monitor.hidden { opacity: 0; transform: translateY(100%); pointer-events: none; }
+#hhsdd-monitor .m-item { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+#hhsdd-monitor .m-label { color: #666; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+#hhsdd-monitor .m-value { font-weight: 600; color: #e0e0e0; }
+#hhsdd-monitor .m-bar {
+    display: inline-block; width: 50px; height: 4px;
+    background: rgba(255,255,255,0.08); border-radius: 2px;
+    overflow: hidden; vertical-align: middle; margin-left: 2px;
+}
+#hhsdd-monitor .m-bar-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+#hhsdd-monitor .m-cache .m-bar-fill { background: #66bb6a; }
+#hhsdd-monitor .m-energy .m-bar-fill { background: #42a5f5; }
+#hhsdd-monitor .m-ctx .m-bar-fill { background: #ffa726; }
+#hhsdd-monitor .m-sep { color: #333; font-size: 14px; }
+
+/* 给页面底部留出空间，避免被状态栏遮挡 */
+body { padding-bottom: 36px !important; }
