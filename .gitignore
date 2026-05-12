@@ -19,3 +19,12 @@ flowchart.md
 cache_experiment/
 test_metrics/
 models.yaml
+/scripts
+public/monitor.json
+monitor-working.png
+monitor-test.png
+intro.txt
+hi_response.txt
+chainlit_stream_test_1.png
+beijing_weather.json
+answer.txt
